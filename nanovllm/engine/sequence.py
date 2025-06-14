@@ -75,7 +75,7 @@ class Sequence:
         self.num_tokens += 1
 
     def __getstate__(self):
-        state = super().__getstate__()
+        state = vars(self).copy()
         if self.num_completion_tokens:
             state.pop("token_ids")
         return state

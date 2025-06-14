@@ -21,8 +21,8 @@ class LinearBase(nn.Module):
         self.input_size = input_size
         self.output_size = output_size
         self.tp_dim = tp_dim
-        self.tp_rank = 0  # get_tensor_model_parallel_rank()
-        self.tp_size = 1  # get_tensor_model_parallel_world_size()
+        self.tp_rank = dist.get_rank()
+        self.tp_size = dist.get_world_size()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
@@ -65,7 +65,6 @@ class ColumnParallelLinear(LinearBase):
         self.input_size_per_partition = input_size
         self.output_size_per_partition = divide(output_size, self.tp_size)
         self.output_partition_sizes = [self.output_size_per_partition]
-        # If QKV or MergedColumn, use output size of each partition.
         if hasattr(self, "output_sizes"):
             self.output_partition_sizes = [
                 divide(output_size, self.tp_size)
@@ -101,8 +100,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         bias: bool = False,
     ):
         self.output_sizes = output_sizes
-        tp_size = 1  # get_tensor_model_parallel_world_size()
-        assert all(output_size % tp_size == 0 for output_size in output_sizes)
         super().__init__(input_size, sum(output_sizes), bias=bias)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int):
@@ -110,7 +107,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
         shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
-        # loaded_weight = loaded_weight.narrow(self.tp_dim, self.tp_rank * shard_size, shard_size)
+        loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
         assert param_data.size() == loaded_weight.size()
         param_data.copy_(loaded_weight)
 
@@ -131,8 +128,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         if total_num_kv_heads is None:
             total_num_kv_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads
-        # Divide the weight matrix along the last dimension.
-        tp_size = 1  # get_tensor_model_parallel_world_size()
+        tp_size = dist.get_world_size()
         self.num_heads = divide(self.total_num_heads, tp_size)
         self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
         input_size = self.hidden_size
@@ -158,7 +154,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             shard_size = self.num_kv_heads * self.head_size
             shard_offset = self.num_heads * self.head_size + self.num_kv_heads * self.head_size
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
-        # loaded_weight = loaded_weight.narrow(self.tp_dim, self.tp_rank * shard_size, shard_size)
+        loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
         assert param_data.size() == loaded_weight.size()
         param_data.copy_(loaded_weight)
 
