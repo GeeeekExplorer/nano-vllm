@@ -23,7 +23,7 @@ See `example.py` for usage. The API mirrors vLLM's interface with minor differen
 See `bench.py` for benchmark.
 
 **Test Configuration:**
-- Hardware: RTX 4070
+- Hardware: RTX 4070, 12GB
 - Model: Qwen3-0.6B
 - Total Requests: 256 sequences
 - Input Length: Randomly sampled between 100–1024 tokens
