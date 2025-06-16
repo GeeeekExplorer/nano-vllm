@@ -14,37 +14,40 @@ from nanovllm.utils.loader import load_model
 
 
 class ModelRunner:
-
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(self, config: Config, rank: int, event: Event | list[Event], smname: str):
         self.config = config
-        hf_config = config.hf_config
+        self.hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
-    
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
-        torch.cuda.set_device(rank)
+        self.smname = smname
+        if self.rank == 0:
+            self.shm = SharedMemory(name=smname, create=True, size=2**20)
+
+    def start(self):
+        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=self.rank)
+        torch.cuda.set_device(self.rank)
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.torch_dtype)
+        torch.set_default_dtype(self.hf_config.torch_dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
-        load_model(self.model, config.model)
+        self.model = Qwen3ForCausalLM(self.hf_config)
+        load_model(self.model, self.config.model)
         self.sampler = Sampler()
-        self.allocate_kv_cache(config.gpu_memory_utilization)
+        self.allocate_kv_cache(self.config.gpu_memory_utilization)
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
+        print(f"rank {self.rank} model loaded!")
         if self.world_size > 1:
-            if rank == 0:
-                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
+            if self.rank == 0:
                 dist.barrier()
             else:
                 dist.barrier()
-                self.shm = SharedMemory(name="nanovllm")
+                self.shm = SharedMemory(name=self.smname)
                 self.loop()
 
     def exit(self):
@@ -204,7 +207,10 @@ class ModelRunner:
         graph_vars["block_tables"].zero_()
     
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        import logging
+        logger = logging.getLogger(__name__)
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        logger.debug(f"run -> prepare_prefill input_ids: {input_ids}")
         temperatures = self.prepare_sample(seqs)
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None

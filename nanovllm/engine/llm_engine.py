@@ -11,26 +11,44 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 
+def sub_process_runner(idx, events, runners):
+    rank = idx + 1
+    import logging
+    #log config for this process (rank)
+    logging.basicConfig(filename=f'rank-{rank}.log', encoding='utf-8', level=logging.DEBUG)
+    _ = events[rank] #visible for this process
+    print(f"rank {rank} waiting to start")
+    runners[rank].start()
+
 
 class LLMEngine:
-
     def __init__(self, model, **kwargs):
         config_fileds = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fileds}
         config = Config(model, **config_kwargs)
         self.ps = []
-        self.events = []
-        for i in range(1, config.tensor_parallel_size):
-            event = mp.Event()
-            process = mp.Process(target=ModelRunner, args=(config, i, event))
-            process.start()
-            self.ps.append(process)
-            self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
+        events = [mp.get_context("spawn").Event() for _ in range(config.tensor_parallel_size)]
+        self.events = events[1:]
+        runners = []
+        for r in range(0, config.tensor_parallel_size):
+            event = events if r == 0 else events[r]
+            runners.append(ModelRunner(config, r, event, config.smname))
+        self.model_runner = runners[0]
+
+        mp.spawn(
+            sub_process_runner,
+            args=(events, runners),
+            nprocs=config.tensor_parallel_size - 1,
+            join=False 
+        )
+        import logging
+        logging.basicConfig(filename='rank-0.log', encoding='utf-8', level=logging.DEBUG)
+        self.model_runner.start()
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
+        print("all ranks loaded!")
 
     def exit(self):
         self.model_runner.call("exit")
