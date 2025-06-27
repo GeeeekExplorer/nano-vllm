@@ -41,16 +41,16 @@ class ModelRunner:
         if self.world_size > 1:
             if rank == 0:
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
-                dist.barrier()
+                dist.barrier(device_ids=[self.rank])
             else:
-                dist.barrier()
+                dist.barrier(device_ids=[self.rank])
                 self.shm = SharedMemory(name="nanovllm")
                 self.loop()
 
     def exit(self):
         if self.world_size > 1:
             self.shm.close()
-            dist.barrier()
+            dist.barrier(device_ids=[self.rank])
             if self.rank == 0:
                 self.shm.unlink()
         if not self.enforce_eager:
