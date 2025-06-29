@@ -74,7 +74,7 @@ class ModelRunner:
         return method_name, args
 
     def write_shm(self, method_name, *args):
-        assert self.world_size > 1 and not self.rank
+        assert self.world_size > 1 and self.rank == 0
         data = pickle.dumps([method_name, *args])
         n = len(data)
         self.shm.buf[0:4] = n.to_bytes(4, "little")
