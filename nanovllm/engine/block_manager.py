@@ -97,17 +97,21 @@ class BlockManager:
     def may_append(self, seq: Sequence):
         block_table = seq.block_table
         last_block = self.blocks[block_table[-1]]
-        if len(seq) % self.block_size == 1:
-            assert last_block.hash != -1
-            block_id = self.free_block_ids[0]
-            self._allocate_block(block_id)
-            block_table.append(block_id)
-        elif len(seq) % self.block_size == 0:
-            assert last_block.hash == -1
+        
+        if len(seq) % self.block_size == 0:
+            # The current token_ids in seq already filled up the last block,
+            # so we need to allocate a new block for the upcoming token
+            # Also finalize the last block hash calculation here.
+            assert last_block.hash == -1  # Block should be unfinalized
             token_ids = seq.block(seq.num_blocks-1)
             prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
             h = self.compute_hash(token_ids, prefix)
             last_block.update(h, token_ids)
             self.hash_to_block_id[h] = last_block.block_id
+            
+            # Allocate a new block for the next token
+            block_id = self.free_block_ids[0]
+            self._allocate_block(block_id)
+            block_table.append(block_id)
         else:
             assert last_block.hash == -1
