@@ -43,16 +43,18 @@ class Scheduler:
         # decode
         while self.running and num_seqs < self.max_num_seqs:
             seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
-                if self.running:
-                    self.preempt(self.running.pop())
+            self.block_manager.check_and_update_hash(seq)
+            if self.block_manager.need_append(seq):
+                while not self.block_manager.can_append(seq):
+                    if self.running:
+                        self.preempt(self.running.pop())
+                    else:
+                        self.preempt(seq)
+                        break
                 else:
-                    self.preempt(seq)
-                    break
-            else:
-                num_seqs += 1
-                self.block_manager.may_append(seq)
-                scheduled_seqs.append(seq)
+                    self.block_manager.append(seq)
+            num_seqs += 1
+            scheduled_seqs.append(seq)
         assert scheduled_seqs
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
