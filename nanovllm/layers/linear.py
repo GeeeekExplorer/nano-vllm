@@ -8,7 +8,9 @@ def divide(numerator, denominator):
     assert numerator % denominator == 0
     return numerator // denominator
 
-
+#实现并行线性层，在分布式环境中高效处理大规模模型的线性变换
+#可以生成注意力机制中的QKV矩阵
+#在MLP中进行前向传播
 class LinearBase(nn.Module):
 
     def __init__(
@@ -92,7 +94,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
         param_data.copy_(loaded_weight)
 
-
+#应该是在这里实现加性噪声
 class QKVParallelLinear(ColumnParallelLinear):
 
     def __init__(
