@@ -38,6 +38,10 @@ class Qwen3Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
 
+        #定义加密旋转矩阵
+        self.q_rotation_matrix = nn.Parameter(torch.eye(self.head_dim), requires_grad=False)
+        self.k_rotation_matrix = nn.Parameter(torch.eye(self.head_dim), requires_grad=False)
+
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
@@ -77,7 +81,13 @@ class Qwen3Attention(nn.Module):
         q = self.q_norm(q.view(-1, self.num_heads, self.head_dim))
         k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim))
         v = v.view(-1, self.num_kv_heads, self.head_dim)
+
         q, k = self.rotary_emb(positions, q, k)
+
+        #加密q，k矩阵
+        q = torch.matmul(q, self.q_rotation_matrix.T)
+        k = torch.matmul(k, self.k_rotation_matrix.T)
+
         o = self.attn(q, k, v)
         output = self.o_proj(o.flatten(1, -1))
         return output
