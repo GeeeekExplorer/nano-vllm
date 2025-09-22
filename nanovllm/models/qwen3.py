@@ -39,8 +39,22 @@ class Qwen3Attention(nn.Module):
         self.scaling = self.head_dim ** -0.5
 
         #定义加密旋转矩阵
-        self.q_rotation_matrix = nn.Parameter(torch.eye(self.head_dim), requires_grad=False)
-        self.k_rotation_matrix = nn.Parameter(torch.eye(self.head_dim), requires_grad=False)
+        # self.q_rotation_matrix = nn.Parameter(torch.eye(self.head_dim), requires_grad=False)
+        # self.k_rotation_matrix = nn.Parameter(torch.eye(self.head_dim), requires_grad=False)
+            
+        # 定义加密转矩阵
+        self.q_encryption_matrix = nn.Parameter(torch.randn(head_dim, head_dim), requires_grad=False)
+        
+        # 安全地计算 k 加密矩阵（避免 BFloat16 错误）
+        with torch.no_grad():
+            q_matrix_float = self.q_encryption_matrix.float()
+            k_matrix_inverse = torch.inverse(q_matrix_float).T
+            self.k_encryption_matrix = nn.Parameter(
+                k_matrix_inverse.to(self.q_encryption_matrix.dtype), 
+                requires_grad=False
+            )
+
+# ...existing code...
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -84,9 +98,31 @@ class Qwen3Attention(nn.Module):
 
         q, k = self.rotary_emb(positions, q, k)
 
+        #加密q，k矩阵 - 添加调试输出
+        q_before_encrypt = q.clone()
+        k_before_encrypt = k.clone()
+
         #加密q，k矩阵
-        q = torch.matmul(q, self.q_rotation_matrix.T)
-        k = torch.matmul(k, self.k_rotation_matrix.T)
+        q = torch.matmul(q, self.q_encryption_matrix.T)
+        k = torch.matmul(k, self.k_encryption_matrix.T)
+
+        # # 验证加密是否起作用（仅在第一次调用时打印）
+        # if not hasattr(self, '_debug_printed'):
+        #     print("=== QK矩阵加密验证 ===")
+
+        #     print(f"Q加密前后是否相同: {torch.allclose(q_before_encrypt, q)}")
+        #     print(f"K加密前后是否相同: {torch.allclose(k_before_encrypt, k)}")
+        #     print(f"Q矩阵形状: {q.shape}")
+        #     print(f"Q加密前均值: {q_before_encrypt.mean().item():.6f}, 标准差: {q_before_encrypt.std().item():.6f}")
+        #     print(f"Q加密后均值: {q.mean().item():.6f}, 标准差: {q.std().item():.6f}")
+
+        #     # 验证旋转保持向量长度
+        #     q_norm_before = torch.norm(q_before_encrypt, dim=-1)
+        #     q_norm_after = torch.norm(q, dim=-1)
+        #     print(f"Q旋转保持向量长度: {torch.allclose(q_norm_before, q_norm_after, atol=1e-5)}")
+
+        #     print("===========================")
+        #     self._debug_printed = True
 
         o = self.attn(q, k, v)
         output = self.o_proj(o.flatten(1, -1))
