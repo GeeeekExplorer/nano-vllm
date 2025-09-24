@@ -24,6 +24,10 @@ class Qwen3Attention(nn.Module):
         qkv_bias: bool = False,
         rope_theta: float = 10000,
         rope_scaling: tuple | None = None,
+
+        #新增参数
+        enable_vector_mask: bool = True,    # 是否启用向量掩码
+        mask_scale: float = 0.05, 
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -38,31 +42,42 @@ class Qwen3Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
 
-        #定义加密旋转矩阵
-        # self.q_rotation_matrix = nn.Parameter(torch.eye(self.head_dim), requires_grad=False)
-        # self.k_rotation_matrix = nn.Parameter(torch.eye(self.head_dim), requires_grad=False)
-            
-        # 定义加密转矩阵
-        self.q_encryption_matrix = nn.Parameter(torch.randn(head_dim, head_dim), requires_grad=False)
+        #1.定义单位加密矩阵，没有加密作用
+        self.q_encryption_matrix = nn.Parameter(torch.eye(self.head_dim), requires_grad=False)
+        self.k_encryption_matrix = nn.Parameter(torch.eye(self.head_dim), requires_grad=False)
+       
+        # #2.定义随机加密矩阵，并求逆得k的加密矩阵，保证输出不变
+        # # 定义加密转矩阵
+        # # 使用正交矩阵，避免求逆操作
+        # def generate_orthogonal_matrix(dim):
+        #     """生成正交矩阵，避免数值不稳定问题"""
+        #     random_matrix = torch.randn(dim, dim, dtype=torch.float32)
+        #     Q, R = torch.linalg.qr(random_matrix)  # 使用新的API
+        #     return Q
         
-        # 安全地计算 k 加密矩阵（避免 BFloat16 错误）
-        with torch.no_grad():
-            q_matrix_float = self.q_encryption_matrix.float()
-            k_matrix_inverse = torch.inverse(q_matrix_float).T
-            self.k_encryption_matrix = nn.Parameter(
-                k_matrix_inverse.to(self.q_encryption_matrix.dtype), 
-                requires_grad=False
-            )
+        # # 生成正交加密矩阵
+        # self.q_encryption_matrix = nn.Parameter(
+        #     generate_orthogonal_matrix(self.head_dim).to(torch.get_default_dtype()), 
+        #     requires_grad=False
+        # )
+        
+        # # K的加密矩阵是Q加密矩阵的转置（正交矩阵的逆就是其转置）
+        # self.k_encryption_matrix = nn.Parameter(
+        #     self.q_encryption_matrix.T.clone(), 
+        #     requires_grad=False
+        # )
 
-# ...existing code...
-
+        # 修改这里：添加掩码参数
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=qkv_bias,
+            enable_mask=enable_vector_mask,    # 新增
+            mask_scale=mask_scale,             # 新增
         )
+        
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -98,37 +113,15 @@ class Qwen3Attention(nn.Module):
 
         q, k = self.rotary_emb(positions, q, k)
 
-        #加密q，k矩阵 - 添加调试输出
-        q_before_encrypt = q.clone()
-        k_before_encrypt = k.clone()
+        q_encrypted = torch.matmul(q, self.q_encryption_matrix.T)
+        k_encrypted = torch.matmul(k, self.k_encryption_matrix.T)
 
-        #加密q，k矩阵
-        q = torch.matmul(q, self.q_encryption_matrix.T)
-        k = torch.matmul(k, self.k_encryption_matrix.T)
-
-        # # 验证加密是否起作用（仅在第一次调用时打印）
-        # if not hasattr(self, '_debug_printed'):
-        #     print("=== QK矩阵加密验证 ===")
-
-        #     print(f"Q加密前后是否相同: {torch.allclose(q_before_encrypt, q)}")
-        #     print(f"K加密前后是否相同: {torch.allclose(k_before_encrypt, k)}")
-        #     print(f"Q矩阵形状: {q.shape}")
-        #     print(f"Q加密前均值: {q_before_encrypt.mean().item():.6f}, 标准差: {q_before_encrypt.std().item():.6f}")
-        #     print(f"Q加密后均值: {q.mean().item():.6f}, 标准差: {q.std().item():.6f}")
-
-        #     # 验证旋转保持向量长度
-        #     q_norm_before = torch.norm(q_before_encrypt, dim=-1)
-        #     q_norm_after = torch.norm(q, dim=-1)
-        #     print(f"Q旋转保持向量长度: {torch.allclose(q_norm_before, q_norm_after, atol=1e-5)}")
-
-        #     print("===========================")
-        #     self._debug_printed = True
-
-        o = self.attn(q, k, v)
+        o = self.attn(q_encrypted, k_encrypted, v)
+        # o = self.attn(q, k, v  )
         output = self.o_proj(o.flatten(1, -1))
         return output
 
-
+#mlp部分也需要进行线性噪声加密吗
 class Qwen3MLP(nn.Module):
 
     def __init__(

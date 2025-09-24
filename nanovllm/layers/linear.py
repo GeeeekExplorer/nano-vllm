@@ -96,45 +96,70 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
 #继承这个类，增加一步对x进行加密的操作
 class QKVParallelLinear(ColumnParallelLinear):
-    # QKV 并行线性层，用于分布式注意力机制中的 Query/Key/Value 权重切分和加载
 
     def __init__(
         self,
-        hidden_size: int,              # 输入特征维度o
-        head_size: int,                # 每个注意力头的维度
-        total_num_heads: int,          # 总的注意力头数（Q头）
-        total_num_kv_heads: int | None = None,  # 总的 KV 头数（可选，默认等于 Q头数）
-        bias: bool = False,            # 是否使用偏置
+        hidden_size: int,
+        head_size: int,
+        total_num_heads: int,
+        total_num_kv_heads: int | None = None,
+        bias: bool = False,
+        enable_mask: bool = True,      # 新增：是否启用掩码
+        mask_scale: float = 0.05,      # 新增：掩码强度（建议从小值开始）
     ):
-        tp_size = dist.get_world_size()  # 并行卡数
-        total_num_kv_heads = total_num_kv_heads or total_num_heads  # KV头数默认等于Q头数
-        self.head_size = head_size      # 保存每头维度
-        self.num_heads = divide(total_num_heads, tp_size)      # 当前卡负责的 Q头数
-        self.num_kv_heads = divide(total_num_kv_heads, tp_size)  # 当前卡负责的 KV头数
-        # 总输出维度 = Q头数 + 2*KV头数（Q,K,V拼接），每头 head_size
+        tp_size = dist.get_world_size()
+        total_num_kv_heads = total_num_kv_heads or total_num_heads
+        self.head_size = head_size
+        self.num_heads = divide(total_num_heads, tp_size)
+        self.num_kv_heads = divide(total_num_kv_heads, tp_size)
+
+        # 计算输出维度
         output_size = (total_num_heads + 2 * total_num_kv_heads) * self.head_size
-        super().__init__(hidden_size, output_size, bias)  # 调用父类构造函数
+        
+        # 调用父类初始化
+        super().__init__(hidden_size, output_size, bias)
+        
+        # 新增：掩码配置
+        self.enable_mask = enable_mask
+        self.mask_scale = mask_scale
+        self.hidden_size = hidden_size
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str):
-        # 分布式加载权重分片
         param_data = param.data
-        assert loaded_shard_id in ["q", "k", "v"]  # 分片类型只能是 q/k/v
+        assert loaded_shard_id in ["q", "k", "v"]
         if loaded_shard_id == "q":
-            shard_size = self.num_heads * self.head_size  # Q分片大小
-            shard_offset = 0                              # Q分片起始位置
+            shard_size = self.num_heads * self.head_size
+            shard_offset = 0
         elif loaded_shard_id == "k":
-            shard_size = self.num_kv_heads * self.head_size  # K分片大小
-            shard_offset = self.num_heads * self.head_size   # K分片起始位置
+            shard_size = self.num_kv_heads * self.head_size
+            shard_offset = self.num_heads * self.head_size
         else:
-            shard_size = self.num_kv_heads * self.head_size  # V分片大小
-            shard_offset = self.num_heads * self.head_size + self.num_kv_heads * self.head_size  # V分片起始位置
-        # 只加载本卡负责的分片
+            shard_size = self.num_kv_heads * self.head_size
+            shard_offset = self.num_heads * self.head_size + self.num_kv_heads * self.head_size
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
-        # 按 tp_size 分块，取本卡的分片
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
-        param_data.copy_(loaded_weight)  # 拷贝权重到参数
+        param_data.copy_(loaded_weight)
 
-
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 如果未启用掩码，直接返回原始计算
+        if not self.enable_mask:
+            return F.linear(x, self.weight, self.bias)
+        
+        # 1. 生成随机向量掩码
+        mask = torch.randn_like(x) * self.mask_scale
+        
+        # 2. 应用掩码：x_masked = x - mask  
+        x_masked = x - mask
+        
+        # 3. 生成掩码后的QKV
+        qkv_masked = F.linear(x_masked, self.weight, self.bias)
+        
+        # 4. 恢复原始QKV：qkv_original = qkv_masked + mask * W
+        mask_effect = F.linear(mask, self.weight, bias=None)
+        qkv_recovered = qkv_masked + mask_effect
+        
+        return qkv_recovered
+    
 class RowParallelLinear(LinearBase):
 
     def __init__(
