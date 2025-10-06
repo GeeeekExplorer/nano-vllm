@@ -69,11 +69,11 @@ class BlockManager:
             if cache_miss:
                 block_id = self.free_block_ids[0]
                 block = self._allocate_block(block_id)
-            else:
-                seq.num_cached_tokens += self.block_size
+            else:              
                 if block_id in self.used_block_ids:
                     block = self.blocks[block_id]
                     block.ref_count += 1
+                    seq.num_cached_tokens += self.block_size
                 else:
                     block = self._allocate_block(block_id)
             if h != -1:
