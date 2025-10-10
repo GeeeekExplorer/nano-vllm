@@ -1,0 +1,6 @@
+日期,修改内容
+2025-10-10,添加 requirements.txt 文件，用于 pip 安装依赖
+2025-10-10,添加 environment.yml 文件，用于 conda 环境配置
+2025-10-10,添加 Dockerfile 文件，用于 Docker 容器部署
+2025-10-10,更新 README.md，添加三种安装方式说明
+2025-10-10,在 prompt/ 文件夹下添加 .gitignore 文件，确保该文件夹不会被提交
