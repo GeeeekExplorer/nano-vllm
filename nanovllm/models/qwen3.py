@@ -9,6 +9,7 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from nanovllm.utils.secure import get_security_config, orthogonal_matrix
 
 
 class Qwen3Attention(nn.Module):
@@ -42,40 +43,24 @@ class Qwen3Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
 
-        #1.定义单位加密矩阵，没有加密作用
-        self.q_encryption_matrix = nn.Parameter(torch.eye(self.head_dim), requires_grad=False)
-        self.k_encryption_matrix = nn.Parameter(torch.eye(self.head_dim), requires_grad=False)
-       
-        # #2.定义随机加密矩阵，并求逆得k的加密矩阵，保证输出不变
-        # # 定义加密转矩阵
-        # # 使用正交矩阵，避免求逆操作
-        # def generate_orthogonal_matrix(dim):
-        #     """生成正交矩阵，避免数值不稳定问题"""
-        #     random_matrix = torch.randn(dim, dim, dtype=torch.float32)
-        #     Q, R = torch.linalg.qr(random_matrix)  # 使用新的API
-        #     return Q
-        
-        # # 生成正交加密矩阵
-        # self.q_encryption_matrix = nn.Parameter(
-        #     generate_orthogonal_matrix(self.head_dim).to(torch.get_default_dtype()), 
-        #     requires_grad=False
-        # )
-        
-        # # K的加密矩阵是Q加密矩阵的转置（正交矩阵的逆就是其转置）
-        # self.k_encryption_matrix = nn.Parameter(
-        #     self.q_encryption_matrix.T.clone(), 
-        #     requires_grad=False
-        # )
+        # 软最大（QK^T）加密：使用正交矩阵 R，满足 R^{-1} = R^T，使 Q->Q R^T, K->K R^T，不改变 QK^T
+        sec = get_security_config()
+        if sec.enable_softmax_encrypt:
+            R = orthogonal_matrix(self.head_dim, dtype=torch.get_default_dtype(), device=torch.device('cpu'))
+        else:
+            R = torch.eye(self.head_dim, dtype=torch.get_default_dtype(), device='cpu')
+        # 单一 R 即可：Q' = Q R, K' = K R，保证 Q'K'^T = QK^T
+        self.encrypt_R = nn.Parameter(R, requires_grad=False)
 
-        # 修改这里：添加掩码参数
+        # 从安全配置读取线性噪声开关与强度
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=qkv_bias,
-            enable_mask=enable_vector_mask,    # 新增
-            mask_scale=mask_scale,             # 新增
+            enable_mask=get_security_config().enable_linear_noise,
+            mask_scale=get_security_config().noise_scale,
         )
         
         self.o_proj = RowParallelLinear(
@@ -113,11 +98,23 @@ class Qwen3Attention(nn.Module):
 
         q, k = self.rotary_emb(positions, q, k)
 
-        q_encrypted = torch.matmul(q, self.q_encryption_matrix.T)
-        k_encrypted = torch.matmul(k, self.k_encryption_matrix.T)
+        # 应用正交加密（TEE on CPU -> 先回到 CPU 再加密并发送给 GPU）
+        from nanovllm.utils.secure import get_security_config
+        sec = get_security_config()
+        if sec.enable_softmax_encrypt and sec.encrypt_on_cpu:
+            R_cpu = self.encrypt_R.detach().to(device="cpu", dtype=torch.float32)
+            q_cpu = q.detach().to(device="cpu", dtype=torch.float32)
+            k_cpu = k.detach().to(device="cpu", dtype=torch.float32)
+            q_enc_cpu = torch.matmul(q_cpu, R_cpu)
+            k_enc_cpu = torch.matmul(k_cpu, R_cpu)
+            q_encrypted = q_enc_cpu.to(device=q.device, dtype=q.dtype)
+            k_encrypted = k_enc_cpu.to(device=k.device, dtype=k.dtype)
+        else:
+            R = self.encrypt_R.to(device=q.device, dtype=q.dtype)
+            q_encrypted = torch.matmul(q, R)
+            k_encrypted = torch.matmul(k, R)
 
         o = self.attn(q_encrypted, k_encrypted, v)
-        # o = self.attn(q, k, v  )
         output = self.o_proj(o.flatten(1, -1))
         return output
 
