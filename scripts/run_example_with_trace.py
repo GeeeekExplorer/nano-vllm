@@ -7,8 +7,17 @@
 可选：将 example.py 中的模型路径修改为你的本地路径。
 """
 
+import os
+import sys
 from nanovllm.utils.secure import set_security_config
 from nanovllm.utils.trace import set_trace_config
+
+# 确保能从项目根目录导入 example.py
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_THIS_DIR)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 import example
 
 
@@ -31,4 +40,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -47,9 +47,10 @@ class Qwen3Attention(nn.Module):
         # 软最大（QK^T）加密：使用正交矩阵 R，满足 R^{-1} = R^T，使 Q->Q R^T, K->K R^T，不改变 QK^T
         sec = get_security_config()
         if sec.enable_softmax_encrypt:
-            R = orthogonal_matrix(self.head_dim, dtype=torch.get_default_dtype(), device=torch.device('cpu'))
+            # 使用 float32 存储 R，保持正交性，避免 bf16 破坏 R R^T ≈ I
+            R = orthogonal_matrix(self.head_dim, dtype=torch.float32, device=torch.device('cpu'))
         else:
-            R = torch.eye(self.head_dim, dtype=torch.get_default_dtype(), device='cpu')
+            R = torch.eye(self.head_dim, dtype=torch.float32, device='cpu')
         # 单一 R 即可：Q' = Q R, K' = K R，保证 Q'K'^T = QK^T
         self.encrypt_R = nn.Parameter(R, requires_grad=False)
 

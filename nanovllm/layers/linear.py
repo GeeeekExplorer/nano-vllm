@@ -237,9 +237,22 @@ class QKVParallelLinear(ColumnParallelLinear):
                 b_cpu = None if self.bias is None else self.bias.detach().to(device="cpu", dtype=torch.float32)
                 x_plain_cpu = x.detach().to(device="cpu", dtype=torch.float32)
                 y_ref_cpu = F.linear(x_plain_cpu, w_cpu, b_cpu)
+
+                # 代数等价性（全 float32 on CPU）：(x - r)W^T + b + rW == xW^T + b
+                if x_plain_cpu.dim() == 2:
+                    r_b_cpu = r_cpu.to(dtype=x_plain_cpu.dtype).unsqueeze(0)
+                else:
+                    view_shape = [1] * (x_plain_cpu.dim() - 1) + [r_cpu.numel()]
+                    r_b_cpu = r_cpu.to(dtype=x_plain_cpu.dtype).view(*view_shape)
+                y_rec_cpu_true = F.linear(x_plain_cpu - r_b_cpu, w_cpu, b_cpu) + rw_cpu.to(dtype=torch.float32).unsqueeze(0)
+                alg_abs_err = (y_ref_cpu - y_rec_cpu_true).abs().max().item()
+
+                # 运行路径（混合精度）：与实际 y 做对比（y 可能来源于 bf16 GPU）
                 y_rec_cpu = y.detach().to(device="cpu", dtype=torch.float32)
-                max_abs_err = (y_ref_cpu - y_rec_cpu).abs().max().item()
-                print_line(f"与明文直算对比 max_abs_err={max_abs_err:.3e} (阈值~1e-3)")
+                run_abs_err = (y_ref_cpu - y_rec_cpu).abs().max().item()
+
+                print_line(f"代数等价性(纯CPU-fp32) max_abs_err={alg_abs_err:.3e} (应≈0)")
+                print_line(f"与明文直算对比(运行路径) max_abs_err={run_abs_err:.3e} (bf16/核函数差异)")
             except Exception as e:
                 print_line(f"参考对比失败: {e}")
 
