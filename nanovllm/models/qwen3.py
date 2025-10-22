@@ -10,6 +10,7 @@ from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.utils.secure import get_security_config, orthogonal_matrix
+from nanovllm.utils.trace import should_trace, print_tensor, print_line
 
 
 class Qwen3Attention(nn.Module):
@@ -113,6 +114,29 @@ class Qwen3Attention(nn.Module):
             R = self.encrypt_R.to(device=q.device, dtype=q.dtype)
             q_encrypted = torch.matmul(q, R)
             k_encrypted = torch.matmul(k, R)
+
+        # 可视化与分数不变性验证（仅打印一次）
+        if should_trace(f"Qwen3Attention:{id(self)}") and get_security_config().enable_softmax_encrypt:
+            print_line("[TRACE][Qwen3Attention] Q/K 正交加密与分数不变性验证")
+            try:
+                # 取一个样本做对比
+                q0 = q.detach().to(device="cpu", dtype=torch.float32)
+                k0 = k.detach().to(device="cpu", dtype=torch.float32)
+                R0 = self.encrypt_R.detach().to(device="cpu", dtype=torch.float32)
+                # 分数不变性：S = q k^T, S' = (qR)(kR)^T = q k^T
+                # 仅取第一行避免打印过大
+                if q0.dim() == 3 and k0.dim() == 3:
+                    qh = q0[0]  # [num_heads, head_dim]
+                    kh = k0[0]
+                    s_ref = torch.matmul(qh, kh.transpose(-1, -2))
+                    s_enc = torch.matmul(qh @ R0, (kh @ R0).transpose(-1, -2))
+                    max_abs_err = (s_ref - s_enc).abs().max().item()
+                    print_tensor("R (TEE, 仅展示前几项)", R0)
+                    print_tensor("q 明文(TEE,CPU)", qh)
+                    print_tensor("q' 密文", qh @ R0)
+                    print_line(f"分数不变性 max_abs_err={max_abs_err:.3e} (阈值~1e-5)")
+            except Exception as e:
+                print_line(f"分数不变性验证失败: {e}")
 
         o = self.attn(q_encrypted, k_encrypted, v)
         output = self.o_proj(o.flatten(1, -1))

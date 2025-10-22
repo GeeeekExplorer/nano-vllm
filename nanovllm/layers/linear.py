@@ -3,6 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 from nanovllm.utils.secure import NoisePool, get_security_config
+from nanovllm.utils.trace import should_trace, print_tensor, print_line
 
 
 def divide(numerator, denominator):
@@ -205,7 +206,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             else:
                 view_shape = [1] * (y_cpu.dim() - 1) + [rw.shape[0]]
                 y_cpu = y_cpu + rw.view(*view_shape)
-            return y_cpu.to(device=y_masked.device, dtype=y_masked.dtype)
+            y = y_cpu.to(device=y_masked.device, dtype=y_masked.dtype)
         else:
             # 在 GPU 上完成补偿
             rw = rw_cpu.to(device=y_masked.device, dtype=y_masked.dtype)
@@ -214,7 +215,35 @@ class QKVParallelLinear(ColumnParallelLinear):
             else:
                 view_shape = [1] * (y_masked.dim() - 1) + [rw.shape[0]]
                 y = y_masked + rw.view(*view_shape)
-            return y
+
+        # 可视化与正确性对比（仅打印一次）
+        if should_trace(f"QKVParallelLinear:{id(self)}"):
+            print_line("[TRACE][QKVParallelLinear] 开始可视化一次加密/解密流程")
+            # 打印关键张量（注意：仅显示前若干项）
+            if sec.encrypt_on_cpu:
+                print_tensor("x 明文(TEE,CPU)", x_cpu)
+                print_tensor("r (TEE,CPU)", r_cpu)
+                print_tensor("x_masked 密文(发送到不可信)", x_masked)
+            else:
+                print_tensor("x 明文(当前设备)", x)
+                print_tensor("r (CPU)", r_cpu)
+                print_tensor("x_masked 密文(当前设备)", x_masked)
+            print_tensor("y_masked 不可信端计算产物", y_masked)
+            print_tensor("rW (TEE 预计算,CPU)", rw_cpu)
+
+            # 在 TEE 内部对照直算（不把明文发到不可信端）：x 与 W 复制到 CPU 做参考
+            try:
+                w_cpu = self.weight.detach().to(device="cpu", dtype=torch.float32)
+                b_cpu = None if self.bias is None else self.bias.detach().to(device="cpu", dtype=torch.float32)
+                x_plain_cpu = x.detach().to(device="cpu", dtype=torch.float32)
+                y_ref_cpu = F.linear(x_plain_cpu, w_cpu, b_cpu)
+                y_rec_cpu = y.detach().to(device="cpu", dtype=torch.float32)
+                max_abs_err = (y_ref_cpu - y_rec_cpu).abs().max().item()
+                print_line(f"与明文直算对比 max_abs_err={max_abs_err:.3e} (阈值~1e-3)")
+            except Exception as e:
+                print_line(f"参考对比失败: {e}")
+
+        return y
     
 class RowParallelLinear(LinearBase):
 
