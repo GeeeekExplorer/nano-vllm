@@ -105,7 +105,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         total_num_heads: int,
         total_num_kv_heads: int | None = None,
         bias: bool = False,
-        enable_mask: bool = True,      # 是否启用输入侧噪声掩码（x -> x - r）
+        enable_mask: bool = True,      # 是否启用加性噪声掩码（x -> x - r）
         mask_scale: float = 0.05,      # 噪声强度
     ):
         tp_size = dist.get_world_size()
