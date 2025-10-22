@@ -30,6 +30,7 @@ class Qwen3Attention(nn.Module):
         #新增参数
         enable_vector_mask: bool = True,    # 是否启用向量掩码
         mask_scale: float = 0.05, 
+        layer_id: int = 0,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -43,6 +44,7 @@ class Qwen3Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
+        self.layer_id = layer_id
 
         # 软最大（QK^T）加密：使用正交矩阵 R，满足 R^{-1} = R^T，使 Q->Q R^T, K->K R^T，不改变 QK^T
         sec = get_security_config()
@@ -63,6 +65,7 @@ class Qwen3Attention(nn.Module):
             bias=qkv_bias,
             enable_mask=get_security_config().enable_linear_noise,
             mask_scale=get_security_config().noise_scale,
+            layer_id=layer_id,
         )
         
         self.o_proj = RowParallelLinear(
@@ -116,30 +119,44 @@ class Qwen3Attention(nn.Module):
             q_encrypted = torch.matmul(q, R)
             k_encrypted = torch.matmul(k, R)
 
-        # 可视化与分数不变性验证（仅打印一次）
-        if should_trace(f"Qwen3Attention:{id(self)}") and get_security_config().enable_softmax_encrypt:
-            print_line("[TRACE][Qwen3Attention] Q/K 正交加密与分数不变性验证")
+        o = self.attn(q_encrypted, k_encrypted, v)
+
+        # 可视化与分数不变性验证（仅打印一次，且只在 layer_filter 命中时打印）
+        from nanovllm.utils.trace import layer_enabled, get_trace_config
+        if layer_enabled(self.layer_id) and should_trace(f"Qwen3Attention:{id(self)}") and get_security_config().enable_softmax_encrypt:
+            cfg = get_trace_config()
+            print_line(f"[TRACE][QK][L{self.layer_id}] 正交加密与分数不变性")
             try:
-                # 取一个样本做对比
+                # 取一个样本做对比（在 CPU 上计算参考分数）
                 q0 = q.detach().to(device="cpu", dtype=torch.float32)
                 k0 = k.detach().to(device="cpu", dtype=torch.float32)
                 R0 = self.encrypt_R.detach().to(device="cpu", dtype=torch.float32)
-                # 分数不变性：S = q k^T, S' = (qR)(kR)^T = q k^T
-                # 仅取第一行避免打印过大
                 if q0.dim() == 3 and k0.dim() == 3:
                     qh = q0[0]  # [num_heads, head_dim]
                     kh = k0[0]
                     s_ref = torch.matmul(qh, kh.transpose(-1, -2))
                     s_enc = torch.matmul(qh @ R0, (kh @ R0).transpose(-1, -2))
-                    max_abs_err = (s_ref - s_enc).abs().max().item()
-                    print_tensor("R (TEE, 仅展示前几项)", R0)
-                    print_tensor("q 明文(TEE,CPU)", qh)
-                    print_tensor("q' 密文", qh @ R0)
-                    print_line(f"分数不变性 max_abs_err={max_abs_err:.3e} (阈值~1e-5)")
+                    abs_err = (s_ref - s_enc).abs().max().item()
+                    denom = s_ref.abs().max().item() + 1e-6
+                    rel_err = abs_err / denom
+
+                    # RMS 不变性（取一个向量）
+                    x = q0[0, 0]
+                    xr = (q0[0, 0] @ R0)
+                    rms = torch.sqrt((x.pow(2)).mean()).item()
+                    rms_r = torch.sqrt((xr.pow(2)).mean()).item()
+                    rms_rel = abs(rms_r - rms) / (abs(rms) + 1e-6)
+
+                    if cfg.summary_only:
+                        pass_score = abs_err <= 1e-5 or rel_err <= 1e-6
+                        pass_rms = rms_rel <= 1e-6
+                        print_line(f"[QK][score] PASS={pass_score} abs={abs_err:.2e} rel={rel_err:.2e}")
+                        print_line(f"[QK][rms]   PASS={pass_rms} rel={rms_rel:.2e}")
+                    else:
+                        print_line(f"R {tuple(R0.shape)} | q/k {tuple(qh.shape)} | o {tuple(o.shape)}")
+                        print_line(f"score abs={abs_err:.2e} rel={rel_err:.2e} | rms_rel={rms_rel:.2e}")
             except Exception as e:
                 print_line(f"分数不变性验证失败: {e}")
-
-        o = self.attn(q_encrypted, k_encrypted, v)
         output = self.o_proj(o.flatten(1, -1))
         return output
 
@@ -178,6 +195,7 @@ class Qwen3DecoderLayer(nn.Module):
     def __init__(
         self,
         config: Qwen3Config,
+        layer_id: int,
     ) -> None:
         super().__init__()
         self.self_attn = Qwen3Attention(
@@ -190,6 +208,7 @@ class Qwen3DecoderLayer(nn.Module):
             head_dim=getattr(config, 'head_dim', None),
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
+            layer_id=layer_id,
         )
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,
@@ -223,7 +242,7 @@ class Qwen3Model(nn.Module):
     ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([Qwen3DecoderLayer(config, layer_id=i) for i in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(

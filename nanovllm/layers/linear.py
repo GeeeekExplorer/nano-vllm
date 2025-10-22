@@ -108,6 +108,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         bias: bool = False,
         enable_mask: bool = True,      # 是否启用加性噪声掩码（x -> x - r）
         mask_scale: float = 0.05,      # 噪声强度
+        layer_id: int | None = None,
     ):
         tp_size = dist.get_world_size()
         total_num_kv_heads = total_num_kv_heads or total_num_heads
@@ -125,6 +126,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         self.enable_mask = enable_mask
         self.mask_scale = mask_scale
         self.hidden_size = hidden_size
+        self.layer_id = layer_id
 
         # 安全配置：是否在 CPU 上执行解密补偿
         sec = get_security_config()
@@ -217,28 +219,16 @@ class QKVParallelLinear(ColumnParallelLinear):
                 y = y_masked + rw.view(*view_shape)
 
         # 可视化与正确性对比（仅打印一次）
-        if should_trace(f"QKVParallelLinear:{id(self)}"):
-            print_line("[TRACE][QKVParallelLinear] 开始可视化一次加密/解密流程")
-            # 打印关键张量（注意：仅显示前若干项）
-            if sec.encrypt_on_cpu:
-                print_tensor("x 明文(TEE,CPU)", x_cpu)
-                print_tensor("r (TEE,CPU)", r_cpu)
-                print_tensor("x_masked 密文(发送到不可信)", x_masked)
-            else:
-                print_tensor("x 明文(当前设备)", x)
-                print_tensor("r (CPU)", r_cpu)
-                print_tensor("x_masked 密文(当前设备)", x_masked)
-            print_tensor("y_masked 不可信端计算产物", y_masked)
-            print_tensor("rW (TEE 预计算,CPU)", rw_cpu)
-
-            # 在 TEE 内部对照直算（不把明文发到不可信端）：x 与 W 复制到 CPU 做参考
+        from nanovllm.utils.trace import layer_enabled, get_trace_config
+        if layer_enabled(self.layer_id) and should_trace(f"QKVParallelLinear:{id(self)}"):
+            cfg = get_trace_config()
+            print_line(f"[TRACE][QKV][L{self.layer_id}] 线性加密流程")
             try:
+                # 参考对比（纯 CPU-fp32 代数等价 + 运行路径）
                 w_cpu = self.weight.detach().to(device="cpu", dtype=torch.float32)
                 b_cpu = None if self.bias is None else self.bias.detach().to(device="cpu", dtype=torch.float32)
                 x_plain_cpu = x.detach().to(device="cpu", dtype=torch.float32)
                 y_ref_cpu = F.linear(x_plain_cpu, w_cpu, b_cpu)
-
-                # 代数等价性（全 float32 on CPU）：(x - r)W^T + b + rW == xW^T + b
                 if x_plain_cpu.dim() == 2:
                     r_b_cpu = r_cpu.to(dtype=x_plain_cpu.dtype).unsqueeze(0)
                 else:
@@ -246,15 +236,27 @@ class QKVParallelLinear(ColumnParallelLinear):
                     r_b_cpu = r_cpu.to(dtype=x_plain_cpu.dtype).view(*view_shape)
                 y_rec_cpu_true = F.linear(x_plain_cpu - r_b_cpu, w_cpu, b_cpu) + rw_cpu.to(dtype=torch.float32).unsqueeze(0)
                 alg_abs_err = (y_ref_cpu - y_rec_cpu_true).abs().max().item()
-
-                # 运行路径（混合精度）：与实际 y 做对比（y 可能来源于 bf16 GPU）
                 y_rec_cpu = y.detach().to(device="cpu", dtype=torch.float32)
                 run_abs_err = (y_ref_cpu - y_rec_cpu).abs().max().item()
 
-                print_line(f"代数等价性(纯CPU-fp32) max_abs_err={alg_abs_err:.3e} (应≈0)")
-                print_line(f"与明文直算对比(运行路径) max_abs_err={run_abs_err:.3e} (bf16/核函数差异)")
+                # 同时给出相对误差，便于不同尺度比较
+                denom = y_ref_cpu.abs().max().item() + 1e-6
+                alg_rel = alg_abs_err / denom
+                run_rel = run_abs_err / denom
+
+                # 简洁输出
+                if cfg.summary_only:
+                    # 阈值策略：代数等价应近似 0；运行路径相对误差在 bf16 下放宽到 1e-1
+                    pass_alg = alg_abs_err <= 1e-6 or alg_rel <= 1e-6
+                    pass_run = run_rel <= 1e-1
+                    print_line(f"[QKV][alg] PASS={pass_alg} abs={alg_abs_err:.2e} rel={alg_rel:.2e}")
+                    print_line(f"[QKV][run] PASS={pass_run} abs={run_abs_err:.2e} rel={run_rel:.2e}")
+                else:
+                    print_line(f"x: {tuple(x.shape)} -> x' {tuple(x_masked.shape)} | W {tuple(self.weight.shape)} | y' {tuple(y_masked.shape)} -> y {tuple(y.shape)}")
+                    print_line(f"r: {tuple(r_cpu.shape)} | rW: {tuple(rw_cpu.shape)} (CPU)")
+                    print_line(f"equiv_err(alg) abs={alg_abs_err:.2e} rel={alg_rel:.2e} | equiv_err(run) abs={run_abs_err:.2e} rel={run_rel:.2e}")
             except Exception as e:
-                print_line(f"参考对比失败: {e}")
+                print_line(f"trace 对比失败: {e}")
 
         return y
     

@@ -32,8 +32,8 @@ def main():
         noise_scale=0.05,
         seed=1234,
     )
-    # 开启可视化追踪：每个关键模块仅打印一次，避免刷屏
-    set_trace_config(enabled=True, head_items=6, max_calls_per_key=1)
+    # 开启可视化追踪：仅打印第 0 层，每个关键模块仅打印一次，避免刷屏
+    set_trace_config(enabled=True, head_items=4, max_calls_per_key=1, layer_filter=0)
 
     example.main()
 
