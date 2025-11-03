@@ -1,8 +1,13 @@
+import os
+from glob import glob
+
 import torch
 from torch import nn
 import torch.distributed as dist
+from safetensors import safe_open
 from transformers import Qwen3Config
 
+from nanovllm.utils.loader import default_weight_loader
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.layernorm import RMSNorm
@@ -213,3 +218,33 @@ class Qwen3ForCausalLM(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         return self.lm_head(hidden_states)
+
+    def load_model(
+        self,
+        path: str,
+    ) -> None:
+        for file in glob(os.path.join(path, "*.safetensors")):
+            with safe_open(file, "pt", "cpu") as f:
+                for weight_name in f.keys():
+                    weight_tensor = f.get_tensor(weight_name)
+                    is_loaded = False
+
+                    # Load packed modules
+                    for k in self.packed_modules_mapping:
+                        if k in weight_name:
+                            v, shard_id = self.packed_modules_mapping[k]
+                            param_name = weight_name.replace(k, v)
+                            param = self.get_parameter(param_name)
+                            weight_loader = getattr(param, "weight_loader")
+                            weight_loader(param, weight_tensor, shard_id)
+                            is_loaded = True
+                            break
+
+                    # Load other modules
+                    if not is_loaded:
+                        param = self.get_parameter(weight_name)
+                        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                        weight_loader(param, weight_tensor)
+                        is_loaded = True
+
+                    assert is_loaded, f"Weight {weight_name} not loaded"

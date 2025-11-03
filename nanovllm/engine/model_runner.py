@@ -6,13 +6,17 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models import Qwen3ForCausalLM, Qwen3MoeForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
 
 class ModelRunner:
+    MODEL_TYPE_DICT = {
+        "qwen3": Qwen3ForCausalLM,
+        "qwen3_moe": Qwen3MoeForCausalLM,
+    }
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
@@ -28,7 +32,7 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        self.model = self.MODEL_TYPE_DICT[hf_config.model_type](hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
