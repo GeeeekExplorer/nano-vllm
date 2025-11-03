@@ -2,6 +2,9 @@
 requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch"]
+
 [project]
 name = "nano-vllm"
 version = "0.2.0"
