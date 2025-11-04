@@ -6,7 +6,7 @@ import triton.language as tl
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
 
-
+# 
 @triton.jit
 def store_kvcache_kernel(
     key_ptr,
@@ -31,7 +31,8 @@ def store_kvcache_kernel(
 
 
 def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor):
-    N, num_heads, head_dim = key.shape
+    # 这里的key和value都是针对一个head的
+    N, num_heads, head_dim = key.shape  # []
     D = num_heads * head_dim
     assert key.stride(-1) == 1 and value.stride(-1) == 1
     assert key.stride(1) == head_dim and value.stride(1) == head_dim
@@ -42,25 +43,24 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
 
 class Attention(nn.Module):
 
-    def __init__(
-        self,
-        num_heads,
-        head_dim,
-        scale,
-        num_kv_heads,
-    ):
+    def __init__(self, num_heads, head_dim, scale, num_kv_heads):
         super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        self.scale = scale
-        self.num_kv_heads = num_kv_heads
-        self.k_cache = self.v_cache = torch.tensor([])
+        self.num_heads = num_heads     # 注意力头数 Q
+        self.head_dim = head_dim       # 每个头的维度
+        self.scale = scale             # 
+        self.num_kv_heads = num_kv_heads  # 注意力头数 KV
+        self.k_cache = self.v_cache = torch.tensor([])  # 创建存储kv cache的tensor
 
+    # prefill阶段 qkv为投影过的矩阵，q[batch, seq_len, num_heads, head_dim] 
+    # kv[batch, seq_len, num_kv_heads, head_dim]
+    # decode阶段  传入的是当前生成token的qkv, q[batch, 1, num_heads, head_dim]
+    # kv [batch, 1, num_kv_heads, head_dim]
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-        context = get_context()
+        context = get_context()   # 推理上下文
         k_cache, v_cache = self.k_cache, self.v_cache
-        if k_cache.numel() and v_cache.numel():
-            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+
+        if k_cache.numel() and v_cache.numel():  # 若kv cache不是空tensor
+            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping) 
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache
