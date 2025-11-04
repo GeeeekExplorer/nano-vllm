@@ -66,11 +66,7 @@ class Qwen3Attention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q = self.q_norm(q.view(-1, self.num_heads, self.head_dim))
@@ -84,12 +80,7 @@ class Qwen3Attention(nn.Module):
 
 class Qwen3MLP(nn.Module):
 
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        hidden_act: str,
-    ) -> None:
+    def __init__(self, hidden_size: int, intermediate_size: int, hidden_act: str) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -110,7 +101,7 @@ class Qwen3MLP(nn.Module):
         x = self.down_proj(x)
         return x
 
-
+# MLP, Attention, RMSNorm
 class Qwen3DecoderLayer(nn.Module):
 
     def __init__(
@@ -152,7 +143,7 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
-
+# VocabParallelEmbedding, DecoderLayer, RMSNorm
 class Qwen3Model(nn.Module):
 
     def __init__(
@@ -177,6 +168,7 @@ class Qwen3Model(nn.Module):
         return hidden_states
 
 
+# Model, ParallelLMHead
 class Qwen3ForCausalLM(nn.Module):
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
