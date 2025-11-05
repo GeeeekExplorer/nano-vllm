@@ -1,0 +1,5 @@
+torch>=2.4.0
+triton>=3.0.0
+transformers>=4.51.0
+flash-attn
+xxhash
