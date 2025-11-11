@@ -31,6 +31,13 @@ huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
   --local-dir-use-symlinks False
 ```
 
+For the multimodal Qwen3-VL-2B-Instruct checkpoint:
+```bash
+huggingface-cli download --resume-download Qwen/Qwen3-VL-2B-Instruct \
+  --local-dir ~/huggingface/Qwen3-VL-2B-Instruct/ \
+  --local-dir-use-symlinks False
+```
+
 ## Quick Start
 
 See `example.py` for usage. The API mirrors vLLM's interface with minor differences in the `LLM.generate` method:
@@ -42,6 +49,8 @@ prompts = ["Hello, Nano-vLLM."]
 outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
+
+For multimodal inference (vision + text), see `example_multimodal.py`.
 
 ## Benchmark
 
