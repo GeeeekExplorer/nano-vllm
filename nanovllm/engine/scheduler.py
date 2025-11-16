@@ -1,8 +1,10 @@
 from collections import deque
+from time import perf_counter_ns
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
+from nanovllm.utils.observer import Observer
 
 
 class Scheduler:
@@ -27,6 +29,8 @@ class Scheduler:
         num_seqs = 0
         num_batched_tokens = 0
         while self.waiting and num_seqs < self.max_num_seqs:
+            if Observer.ttft_start == 0:
+                Observer.ttft_start = perf_counter_ns()
             seq = self.waiting[0]
             if num_batched_tokens + len(seq) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
                 break
