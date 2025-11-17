@@ -64,23 +64,12 @@ def store_kvcache_pytorch(
         v_cache: Shape (num_blocks, block_size, num_kv_heads, head_dim)
         slot_mapping: Shape (num_tokens,)
     """
-    num_tokens = key.shape[0]
     block_size = 256
-    
-    for i in range(num_tokens):
-        slot_idx = slot_mapping[i].item()
-        
-        # Skip if slot index is -1 (invalid)
-        if slot_idx == -1:
-            continue
-            
-        # Calculate block index and offset within block
-        block_idx = slot_idx // block_size
-        offset_in_block = slot_idx % block_size
-        
-        # Copy key and value data to cache
-        k_cache[block_idx, offset_in_block] = key[i]
-        v_cache[block_idx, offset_in_block] = value[i]
+    block_idx = slot_mapping // block_size
+    offset_in_block = slot_mapping % block_size
+
+    k_cache[block_idx, offset_in_block] = key
+    v_cache[block_idx, offset_in_block] = value
 
 class Attention(nn.Module):
 
@@ -108,13 +97,11 @@ class Attention(nn.Module):
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
-        # NOTE: We pass 'context' directly as an argument 
-        # instead of using the global get_context()
-        
+
         # 1. Store new K/V tokens into the cache
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
-            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+            store_kvcache_pytorch(k, v, k_cache, v_cache, context.slot_mapping)
 
         # 2. Perform Attention
         if context.is_prefill:
@@ -136,15 +123,10 @@ class Attention(nn.Module):
                 if seq_len_q == 0:
                     continue # Skip empty sequences
 
-                # Add batch dim for SDPA: (1, num_q_heads, seq_len_q, head_dim)
-                q_b = q_seq.permute(1, 0, 2).unsqueeze(0)
-                
                 k_seq = v_seq = None
                 
                 if context.block_tables is not None:
-                    # --- PagedAttention Prefill ---
                     # Gather K/V from paged cache for this sequence
-                    
                     k_context_len = (context.cu_seqlens_k[i+1] - context.cu_seqlens_k[i]).item()
                     seq_len_k = k_context_len
                     
@@ -157,12 +139,16 @@ class Attention(nn.Module):
                         physical_block_nums = context.block_tables[i, block_idx_for_token]
                         offset_in_block = token_indices % self.block_size
                         slot_indices = physical_block_nums * self.block_size + offset_in_block
-                        
-                        # Gather and reshape from (S_k, N_kv*H) to (S_k, N_kv, H)
-                        k_seq_flat = k_cache[physical_block_nums, offset_in_block] # LLM generated k_cache[slot_indices] which is incorrect?
-                        v_seq_flat = v_cache[physical_block_nums, offset_in_block]
-                        k_seq = k_seq_flat.view(seq_len_k, self.num_kv_heads, self.head_dim)
-                        v_seq = v_seq_flat.view(seq_len_k, self.num_kv_heads, self.head_dim)
+
+                        # Gather Q
+                        if seq_len_k > seq_len_q:
+                            a_dict = {v.item(): i for i, v in enumerate(context.slot_mapping)}
+                            c = torch.tensor([a_dict[v.item()] for v in slot_indices])
+                            q_seq = q[c]
+
+                        # Gather KV
+                        k_seq = k_cache[physical_block_nums, offset_in_block]
+                        v_seq = v_cache[physical_block_nums, offset_in_block]
                 
                 else:
                     # --- Non-Paged Prefill ---
@@ -181,6 +167,7 @@ class Attention(nn.Module):
 
                 # Add batch dim for SDPA
                 # (1, num_q_heads, seq_len_k, head_dim)
+                q_b = q_seq.permute(1, 0, 2).unsqueeze(0)
                 k_b = k_seq_rep.permute(1, 0, 2).unsqueeze(0)
                 v_b = v_seq_rep.permute(1, 0, 2).unsqueeze(0)
                 
@@ -194,6 +181,8 @@ class Attention(nn.Module):
                 
                 # (1, N_h, S_q, H) -> (S_q, N_h, H)
                 o_seq = o_seq_b.squeeze(0).permute(1, 0, 2)
+                if seq_len_k > seq_len_q:
+                    o_seq = o_seq[-seq_len_q:] #only new tokens returned
                 output_list.append(o_seq)
 
             # Stack all sequence outputs back into a single un-padded tensor
