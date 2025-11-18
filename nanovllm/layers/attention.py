@@ -142,8 +142,7 @@ class Attention(nn.Module):
 
                         # Gather Q
                         if seq_len_k > seq_len_q:
-                            a_dict = {v.item(): i for i, v in enumerate(context.slot_mapping)}
-                            c = torch.tensor([a_dict[v.item()] for v in slot_indices])
+                            c = torch.searchsorted(context.slot_mapping, slot_indices)
                             q_seq = q[c]
 
                         # Gather KV
