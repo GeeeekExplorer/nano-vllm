@@ -101,7 +101,7 @@ class Attention(nn.Module):
         # 1. Store new K/V tokens into the cache
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
-            store_kvcache_pytorch(k, v, k_cache, v_cache, context.slot_mapping)
+            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
 
         # 2. Perform Attention
         if context.is_prefill:
@@ -193,8 +193,6 @@ class Attention(nn.Module):
         else:
             # --- DECODE LOGIC ---
             # Input q is (batch_size, num_q_heads, head_dim)
-            # This is already batched, so we can do one batched SDPA call.
-            
             batch_size = q.shape[0]
 
             # Reshape q for SDPA: (B, N_q, 1, H)
@@ -210,68 +208,23 @@ class Attention(nn.Module):
             # 3. Find block indices: (B, max_seq_len_k)
             block_idx_for_token = token_indices // self.block_size
             
-            # 4. Ensure block indices are within bounds of block table
-            max_block_idx = context.block_tables.shape[1] - 1
-            block_idx_for_token = torch.clamp(block_idx_for_token, 0, max_block_idx)
-            
-            # 5. Find physical block numbers: (B, max_seq_len_k)
-            # We use gather to select block numbers from the table
-            physical_block_nums = torch.gather(context.block_tables, 1, block_idx_for_token)
-            
-            # 6. Find offsets in block: (B, max_seq_len_k)
+            # 4. Find phsical block indices
+            absolute_indices = torch.arange(context.block_tables.size(0))[:, None]
+            physical_block_nums = context.block_tables[absolute_indices, block_idx_for_token]
+
+            # 5. Find offsets in block: (B, max_seq_len_k)
             offset_in_block = token_indices % self.block_size
             
-            # 7. Calculate final slot indices: (B, max_seq_len_k)
+            # 6. Calculate final slot indices: (B, max_seq_len_k)
             slot_indices = physical_block_nums * self.block_size + offset_in_block
             
-            # 8. Create padding mask: (B, max_seq_len_k)
+            # 7. Create padding mask: (B, max_seq_len_k)
             # True for valid tokens, False for padding
             valid_token_mask = (token_indices < context.context_lens.unsqueeze(1))
             
-            # 9. Ensure slot indices are within cache bounds for valid tokens
-            cache_size = k_cache.shape[0] * k_cache.shape[1]
-            slot_indices = torch.clamp(slot_indices, 0, cache_size - 1)
-            
-            # 10. Set slot indices for padding tokens to 0 (to avoid OOB)
-            # These will be masked out by attn_mask anyway.
-            slot_indices[~valid_token_mask] = 0
-            
-            # 11. Flatten indices and gather from cache
-            # Only gather valid tokens to avoid OOB errors
-            valid_slot_indices = slot_indices[valid_token_mask]
-            
-            # The cache has shape [num_blocks, block_size, num_kv_heads, head_dim]
-            # We need to calculate block indices and offsets within blocks
-            block_indices = valid_slot_indices // self.block_size
-            offsets_in_block = valid_slot_indices % self.block_size
-            
-            # Gather from the cache using the correct indexing
-            k_valid_flat = k_cache[block_indices, offsets_in_block] # (num_valid_tokens, num_kv_heads, head_dim)
-            v_valid_flat = v_cache[block_indices, offsets_in_block] # (num_valid_tokens, num_kv_heads, head_dim)
-            
-            # Flatten the KV heads and head_dim dimensions
-            k_valid_flat = k_valid_flat.reshape(-1, self.num_kv_heads * self.head_dim)
-            v_valid_flat = v_valid_flat.reshape(-1, self.num_kv_heads * self.head_dim)
-            
-            # 12. Create output tensors with proper padding
-            # Initialize with zeros for padding
-            k_past = torch.zeros(batch_size, max_seq_len_k, self.num_kv_heads * self.head_dim, 
-                               device=k_cache.device, dtype=k_cache.dtype)
-            v_past = torch.zeros(batch_size, max_seq_len_k, self.num_kv_heads * self.head_dim,
-                               device=v_cache.device, dtype=v_cache.dtype)
-            
-            # Fill in the valid tokens - we need to flatten the mask to match the gathered data
-            flat_valid_mask = valid_token_mask.view(-1)
-            k_past2 = k_past.view(-1, self.num_kv_heads * self.head_dim)
-            k_past2[flat_valid_mask] = k_valid_flat
-            v_past2 = v_past.view(-1, self.num_kv_heads * self.head_dim)
-            v_past2[flat_valid_mask] = v_valid_flat
-            
-            # Reshape to final shape (B, S_k, N_kv, H)
-            k_past = k_past2.view(batch_size, max_seq_len_k, self.num_kv_heads, self.head_dim)
-            v_past = v_past2.view(batch_size, max_seq_len_k, self.num_kv_heads, self.head_dim)
-            
-            # --- End Gather ---
+            # 8. Gather from the cache using the correct indexing
+            k_past = k_cache[physical_block_nums, offset_in_block] # (num_valid_tokens, num_kv_heads, head_dim)
+            v_past = v_cache[physical_block_nums, offset_in_block] # (num_valid_tokens, num_kv_heads, head_dim)
 
             # Handle GQA: Repeat K/V
             # (B, S_k, N_kv, H) -> (B, S_k, N_q, H)
