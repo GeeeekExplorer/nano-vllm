@@ -22,6 +22,9 @@ dependencies = [
 [project.urls]
 Homepage="https://github.com/GeeeekExplorer/nano-vllm"
 
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch", "ninja", "packaging", "psutil"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["nanovllm*"]
