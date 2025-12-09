@@ -156,6 +156,37 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
+    def forward_attention_stage(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Attention stage for M2 pipeline (GPU1 only).
+        Returns intermediate states for FFN stage.
+        """
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = self.self_attn(positions, hidden_states)
+        return hidden_states, residual
+
+    def forward_ffn_stage(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        FFN stage for M2 pipeline (GPU1 only).
+        Takes intermediate states from attention stage.
+        """
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
+        return hidden_states, residual
+
 
 class Qwen3Model(nn.Module):
 
@@ -164,7 +195,7 @@ class Qwen3Model(nn.Module):
         config: Qwen3Config,
     ) -> None:
         super().__init__()
-        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)# 词汇表并行嵌入层  将token ID转换为向量表示
         self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -177,6 +208,60 @@ class Qwen3Model(nn.Module):
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)
+        hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states
+
+    def forward_attention_stage(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor], dict]:
+        """
+        Attention stage for all layers (M2 pipeline, GPU1 only).
+        Returns intermediate states and residuals for FFN stage.
+        """
+        hidden_states = self.embed_tokens(input_ids)
+        residual = None
+        residuals = []  # Store residuals for each layer
+        comm_details: list[dict] = []
+        total_bytes = 0
+        for idx, layer in enumerate(self.layers):
+            hidden_states, residual = layer.forward_attention_stage(positions, hidden_states, residual)
+            residuals.append(residual)
+            attention_bytes = hidden_states.numel() * hidden_states.element_size()
+            residual_bytes = residual.numel() * residual.element_size() if residual is not None else 0
+            layer_bytes = attention_bytes + residual_bytes
+            total_bytes += layer_bytes
+            comm_details.append(
+                {
+                    "layer_idx": idx,
+                    "attention_bytes": attention_bytes,
+                    "residual_bytes": residual_bytes,
+                    "total_bytes": layer_bytes,
+                }
+            )
+        metadata = {
+            "per_layer": comm_details,
+            "total_bytes": total_bytes,
+            "batch_size": hidden_states.shape[0],
+            "hidden_size": hidden_states.shape[-1],
+            "dtype": str(hidden_states.dtype),
+        }
+        return hidden_states, residual, residuals, metadata
+
+    def forward_ffn_stage(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        residuals: list[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        FFN stage for all layers (M2 pipeline, GPU1 only).
+        Takes intermediate states from attention stage.
+        """
+        # Process FFN for each layer
+        for i, layer in enumerate(self.layers):
+            hidden_states, residual = layer.forward_ffn_stage(hidden_states, residuals[i])
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -214,3 +299,26 @@ class Qwen3ForCausalLM(nn.Module):
     ) -> torch.Tensor:
         logits = self.lm_head(hidden_states)
         return logits
+
+    def forward_attention_stage(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor], dict]:
+        """
+        Attention stage for M2 pipeline (GPU1 only).
+        Returns intermediate states for FFN stage.
+        """
+        return self.model.forward_attention_stage(input_ids, positions)
+
+    def forward_ffn_stage(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        residuals: list[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        FFN stage for M2 pipeline (GPU1 only).
+        Returns final hidden states (before logits).
+        """
+        return self.model.forward_ffn_stage(hidden_states, residual, residuals)

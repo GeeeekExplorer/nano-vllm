@@ -55,7 +55,6 @@ class RotaryEmbedding(nn.Module):
         return query, key
 
 
-@lru_cache(1)
 def get_rope(
     head_size: int,
     rotary_dim: int,
@@ -63,6 +62,11 @@ def get_rope(
     base: float,
     rope_scaling: dict | None = None,
 ):
+    """Create a RotaryEmbedding instance.
+
+    Note: LRU cache removed to support multi-device scenarios where each model
+    instance needs its own RoPE with buffers on the correct device.
+    """
     assert rope_scaling is None
     rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
     return rotary_emb

@@ -6,6 +6,9 @@ __pycache__/
 # C extensions
 *.so
 
+# Model
+Qwen3-0.6B
+
 # Distribution / packaging
 .Python
 build/
