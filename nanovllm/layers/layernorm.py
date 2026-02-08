@@ -19,10 +19,10 @@ class RMSNorm(nn.Module):
         x: torch.Tensor,
     ) -> torch.Tensor:
         orig_dtype = x.dtype
-        x = x.float()
-        var = x.pow(2).mean(dim=-1, keepdim=True)
-        x.mul_(torch.rsqrt(var + self.eps))
-        x = x.to(orig_dtype).mul_(self.weight)
+        x_fp32 = x.to(torch.float32, copy=True)
+        var = x_fp32.pow(2).mean(dim=-1, keepdim=True)
+        x_fp32.mul_(torch.rsqrt(var + self.eps))
+        x = x_fp32.to(orig_dtype).mul_(self.weight)
         return x
 
     @torch.compile
@@ -32,11 +32,13 @@ class RMSNorm(nn.Module):
         residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         orig_dtype = x.dtype
-        x = x.float().add_(residual.float())
-        residual = x.to(orig_dtype)
-        var = x.pow(2).mean(dim=-1, keepdim=True)
-        x.mul_(torch.rsqrt(var + self.eps))
-        x = x.to(orig_dtype).mul_(self.weight)
+        x_fp32 = x.to(torch.float32, copy=True)
+
+        x_fp32 = x_fp32.add_(residual.float())
+        residual = x_fp32.to(orig_dtype, copy=True)
+        var = x_fp32.pow(2).mean(dim=-1, keepdim=True)
+        x_fp32.mul_(torch.rsqrt(var + self.eps))
+        x = x_fp32.to(orig_dtype).mul_(self.weight)
         return x, residual
 
     def forward(
