@@ -15,7 +15,7 @@ class Sequence:
     block_size = 256
     counter = count()
 
-    def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
+    def __init__(self, token_ids: list[int], sampling_params=SamplingParams()):
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
@@ -44,11 +44,11 @@ class Sequence:
 
     @property
     def prompt_token_ids(self):
-        return self.token_ids[:self.num_prompt_tokens]
+        return self.token_ids[: self.num_prompt_tokens]
 
     @property
     def completion_token_ids(self):
-        return self.token_ids[self.num_prompt_tokens:]
+        return self.token_ids[self.num_prompt_tokens :]
 
     @property
     def num_cached_blocks(self):
@@ -64,7 +64,7 @@ class Sequence:
 
     def block(self, i):
         assert 0 <= i < self.num_blocks
-        return self.token_ids[i*self.block_size: (i+1)*self.block_size]
+        return self.token_ids[i * self.block_size : (i + 1) * self.block_size]
 
     def append_token(self, token_id: int):
         self.token_ids.append(token_id)
@@ -72,11 +72,21 @@ class Sequence:
         self.num_tokens += 1
 
     def __getstate__(self):
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
-                self.token_ids if self.num_completion_tokens == 0 else self.last_token)
+        return (
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.block_table,
+            self.token_ids if self.num_completion_tokens == 0 else self.last_token,
+        )
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:-1]
+        (
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.block_table,
+        ) = state[:-1]
         if self.num_completion_tokens == 0:
             self.token_ids = state[-1]
         else:

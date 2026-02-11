@@ -3,7 +3,6 @@ from torch import nn
 
 
 class RMSNorm(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,

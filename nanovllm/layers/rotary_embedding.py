@@ -15,7 +15,6 @@ def apply_rotary_emb(
 
 
 class RotaryEmbedding(nn.Module):
-
     def __init__(
         self,
         head_size: int,
@@ -26,7 +25,9 @@ class RotaryEmbedding(nn.Module):
         super().__init__()
         self.head_size = head_size
         assert rotary_dim == head_size
-        inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim)
+        )
         t = torch.arange(max_position_embeddings, dtype=torch.float)
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()
