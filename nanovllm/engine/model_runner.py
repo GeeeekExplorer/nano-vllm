@@ -21,9 +21,6 @@ The main process (rank=0) sends the sequences to all other processes (rank > 0) 
 See model implementation.
 Only rank=0 returns the logits, other ranks return None.
 
-
-
-
 """
 
 import pickle
