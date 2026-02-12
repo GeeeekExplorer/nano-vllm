@@ -1,3 +1,10 @@
+"""Attention module for computing self-attention with flash attention and
+managing the KV cache for both prefill and decode steps.
+
+TODO@max: There seems to be no multi-turn conversation support in the current implementation.
+
+"""
+
 import torch
 from torch import nn
 import triton
@@ -38,12 +45,18 @@ def store_kvcache(
     v_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
 ):
+    """
+    Copies the key and value tensors to the kv cache according to the slot mapping.
+    The slot mapping indicates the actual cache slot indices in the allocated kv cache.
+    """
+    # N = number of tokens
     N, num_heads, head_dim = key.shape
     D = num_heads * head_dim
     assert key.stride(-1) == 1 and value.stride(-1) == 1
     assert key.stride(1) == head_dim and value.stride(1) == head_dim
     assert k_cache.stride(1) == D and v_cache.stride(1) == D
     assert slot_mapping.numel() == N
+    # Naively parallelize over tokens, copy the key and value tensors to the kv cache according to the slot mapping.
     store_kvcache_kernel[(N,)](
         key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D
     )
@@ -62,16 +75,23 @@ class Attention(nn.Module):
         self.head_dim = head_dim
         self.scale = scale
         self.num_kv_heads = num_kv_heads
-        self.k_cache = self.v_cache = torch.tensor([])
+        self.k_cache = self.v_cache = torch.tensor(
+            []
+        )  # shape: (N_kv_cache_slots, block_size, num_kv_heads, head_dim)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        # shape q: (N, num_heads, head_dim), kv: (N, num_kv_heads, head_dim)
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
             if context.block_tables is not None:  # prefix cache
-                k, v = k_cache, v_cache
+                # In case of prefix cache (multi-turn conversation), we need to use block tables for flash attention.
+                k, v = (
+                    k_cache,
+                    v_cache,
+                )  # shape: (N_kv_cache_slots, block_size, num_kv_heads, head_dim)
             o = flash_attn_varlen_func(
                 q,
                 k,

@@ -59,7 +59,7 @@ class ColumnParallelLinear(LinearBase):
         tp_size = dist.get_world_size()
         super().__init__(input_size, divide(output_size, tp_size), bias, 0)
 
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, *args):
         param_data = param.data
         shard_size = param_data.size(self.tp_dim)
         start_idx = self.tp_rank * shard_size
