@@ -60,6 +60,9 @@ See `bench.py` for benchmark.
 | vLLM           | 133,966     | 98.37    | 1361.84               |
 | Nano-vLLM      | 133,966     | 93.41    | 1434.13               |
 
+## Learn More
+
+- **[System Architecture](./docs/structures.md)**: A comprehensive guide to the design and data flow of Nano-vLLM. 
 
 ## Star History
 
