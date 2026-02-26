@@ -17,8 +17,9 @@ Nano-vLLM is a lightweight inference framework that supports running with Tensor
 The overall architecture is shown in the figure below:
 
 <p align="center">
-<img src="assets/architecture.png">
+<img src="../assets/overall_architecture.jpg">
 </p>
+
 
 ## Module Introduction
 
@@ -29,7 +30,7 @@ Runner instance. Its main logic is encapsulated in the `generate` function, and 
 parameters. The execution steps are as follows (illustrated in conjunction with the diagram below):
 
 <p align="center">
-<img src="assets/llm_engine_data_flow.png">
+<img src="../assets/llm_engine_architecture.jpg">
 </p>
 
 1. Upon receiving a user request, the prompt is encoded into token IDs using a tokenizer, and a `Sequence` instance is
@@ -53,7 +54,7 @@ The scheduler internally creates a Block Manager instance, which is used to allo
 main execution steps are as follows (illustrated in conjunction with the diagram below):
 
 <p align="center">
-<img src="assets/scheduler_data_flow.png">
+<img src="../assets/scheduler_architecture.jpg">
 </p>
 
 1. After receiving a new request, it is added to the waiting queue.
@@ -71,7 +72,7 @@ other processes via `SharedMemory`; only rank 0 returns the computation results.
 `run`. The execution steps are as follows (illustrated in conjunction with the diagram below):
 
 <p align="center">
-<img src="assets/mdoel_runner_data_flow.png">
+<img src="../assets/model_runner_architecture.jpg">
 </p>
 
 0. When the inference service starts, it must load the model parameters, create the KV cache, and perform warm-up.
