@@ -22,7 +22,7 @@ class Scheduler:
         self.waiting.append(seq)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
-        # prefill
+        # prefill: try prefill first.
         scheduled_seqs = []
         num_seqs = 0
         num_batched_tokens = 0
@@ -40,7 +40,7 @@ class Scheduler:
         if scheduled_seqs:
             return scheduled_seqs, True
 
-        # decode
+        # decode: fallback to try decode next.
         while self.running and num_seqs < self.max_num_seqs:
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq):
