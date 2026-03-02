@@ -109,7 +109,14 @@ class ModelRunner:
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        self.kv_cache = torch.empty(
+            2, # K and V 
+            hf_config.num_hidden_layers, # one per transformer layer
+            config.num_kvcache_blocks, # total physical blocks
+            self.block_size, # 256 tokens per block
+            num_kv_heads, # number of key/value heads
+            head_dim # dimension of each key/value head
+        )
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):

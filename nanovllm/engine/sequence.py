@@ -11,6 +11,7 @@ class SequenceStatus(Enum):
     FINISHED = auto()
 
 
+# One sequence is one continuous conversation context processed by the model.
 class Sequence:
     block_size = 256
     counter = count()
@@ -22,10 +23,11 @@ class Sequence:
         self.last_token = token_ids[-1]
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
+        # how many tokens were found in prefix cache.
         self.num_cached_tokens = 0
         # list of block indices that have been cached, e.g. [0, 1] means tokens
         # in block 0 and 1 are cached.
-        self.block_table = [] # no KV cache blocks yet.
+        self.block_table = [] # list of physical block IDs.
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
