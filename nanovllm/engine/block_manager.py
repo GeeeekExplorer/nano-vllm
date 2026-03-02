@@ -8,10 +8,12 @@ from nanovllm.engine.sequence import Sequence
 class Block:
 
     def __init__(self, block_id):
-        self.block_id = block_id
+        self.block_id = block_id # physical block id, e.g. 0, 1, 2, ...
+        # how many active sequences currently point to this same physical KV
+        # cache block in GPU memory.
         self.ref_count = 0
-        self.hash = -1
-        self.token_ids = []
+        self.hash = -1 # content hash, for prefix caching.
+        self.token_ids = [] # the tokens stored in this block.
 
     def update(self, hash: int, token_ids: list[int]):
         self.hash = hash
@@ -26,12 +28,16 @@ class Block:
 class BlockManager:
 
     def __init__(self, num_blocks: int, block_size: int):
-        self.block_size = block_size
-        self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
+        self.block_size = block_size # number of tokens in each block, e.g. 256
+        self.blocks: list[Block] = [Block(i) for i in range(num_blocks)] # all physical blocks.
+        # hash -> block_id lookup, so the hash is per block / page.
         self.hash_to_block_id: dict[int, int] = dict()
-        self.free_block_ids: deque[int] = deque(range(num_blocks))
-        self.used_block_ids: set[int] = set()
+        self.free_block_ids: deque[int] = deque(range(num_blocks)) # free available blocks.
+        self.used_block_ids: set[int] = set() # in-use blocks.
 
+    # If a prompt are some blocks hash hit, then that prompt only needs to
+    # compute attention for the cache missed tokens, the KV cache for the shared
+    # prefix is already in GPU memory.
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
         h = xxhash.xxh64()
