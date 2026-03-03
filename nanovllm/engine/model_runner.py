@@ -23,17 +23,71 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
+        # 1. Initialize distributed (NCCL) - even for single GPU here (world_size=1)
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
-        default_dtype = torch.get_default_dtype()
+        # 2. Set default dtype and device, then build model skeleton.
+        default_dtype = torch.get_default_dtype() # e.g., bfloat16
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        # PyTorch can NOT load model directly into layers, it first needs to
+        # know the shape of each weight tensor.
+        self.model = Qwen3ForCausalLM(hf_config) # empty model, weights will be loaded later.
+        # 3. Load wrights from safetensors files.
         load_model(self.model, config.model)
         self.sampler = Sampler()
+        # 4. Warmup - run a dummy forward pass at max capacity.
+        # Reasons for warmup: (a) measure peak activation memory. (b) trigger PyTorch/CUDA lazy initializaton.
         self.warmup_model()
+        # 5. Allocate KV cache - uses peak memory from warmup to calculate how many blocks fit.
+        '''
+        Example, RTX 4070 8GB with Qwen3-0.6B
+
+        GPU total memory:            8,192 MB
+        gpu_memory_utilization:      0.9  →  7,373 MB usable
+        Model weights (bfloat16):    ~1,200 MB
+        Peak activations (warmup):   ~800 MB
+        ───────────────────────────────────
+        Available for KV cache:      ~5,373 MB
+
+        Each KV cache block costs (for Qwen3-0.6B: 28 layers, 8 kv_heads, 64 head_dim, bfloat16):
+        block_bytes = 2 (K+V) × 28 (layers) × 256 (tokens) × 8 (heads) × 64 (dim) × 2 (bfloat16)
+            = 2 × 28 × 256 × 8 × 64 × 2
+            = 14,680,064 bytes ≈ 14 MB per block
+        
+        Number of blocks: 5,373 MB / 14 MB ≈ 383 blocks
+
+        Total KV cache capacity: 383 blocks × 256 tokens = 98,048 tokens
+        '''
+
+        '''
+        The Qwen3-0.6B structure broken down:
+
+        - Transformer layers: a transformer model is a stack of identical
+          layers, each layer does: Input → LayerNorm → Attention → LayerNorm →
+          MLP → Output Qwen3-0.6B has 28 of these layers stacked on top of each
+          other. Each layer has its own KV cache because each layer computes its
+          own attention over the same sequence but with different parameters /
+          weights.
+        
+        - KV heads: multi-head attention splits the hidden states into multiple
+          "heads" to capture different aspects of the input. Qwen3-0.6B has 8
+          key-value heads, which means the hidden states are split into 8 parts
+          for attention computation. Each head has its own KV cache because they
+          attend to the same sequence but with different parameters.
+        
+        - Head dimension: each attention head has a certain dimension (e.g.,
+          64), which is the size of the vectors used in attention computation.
+          The KV cache stores the key and value vectors for each head, so the
+          size of the cache depends on the head dimension as well.
+          e.g.:
+          hidden_size = 1024 (the model's full representation width)
+          num_attention_heads = 16
+          head_dim = hidden_size / num_attention_heads = 1024 / 16 = 64
+        '''
         self.allocate_kv_cache()
         if not self.enforce_eager:
+            # 6. Capture CUDA graphs for decode with different batch sizes.
             self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
