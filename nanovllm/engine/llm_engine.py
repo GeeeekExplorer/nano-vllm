@@ -14,7 +14,7 @@ class LLMEngine:
 
     def __init__(self, model, **kwargs):
         # 1. Build Config from kwargs.
-        # Use fields to return metadata aboyt each dataclass field.
+        # Use fields to return metadata about each dataclass field.
         # e.g. each element in that list contains infor like field name, type, default value, etc.
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
