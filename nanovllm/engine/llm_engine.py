@@ -13,16 +13,26 @@ from nanovllm.engine.model_runner import ModelRunner
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
-        # 1. Build Config from kwargs.
-        # Use fields to return metadata about each dataclass field.
-        # e.g. each element in that list contains infor like field name, type, default value, etc.
+        # 1. Build Config from kwargs. Use fields to return metadata about each
+        # dataclass field. Can be not only the field name, e.g. each element in
+        # that list contains infor like field name, type, default value, etc.
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        # Init worker processes (do the work) and their sync events (coordinate the work).
         self.ps = []
         self.events = []
+        # spawn starts a fresh Python interpreter and imports everything from
+        # scratch, which is required for CUDA. fork and forkserver won't work
+        # because they inherit CUDA context from the parent process, which
+        # causes errors.
         ctx = mp.get_context("spawn")
         # 2. Spawn worker processes for tensor parallelism.
+        # FYI, tensor parallelism is split the computation of a single neural
+        # network layer across multiple GPUs, so they work together on the same
+        # model at the same time.
+        # FYI, sum partial outputs -> all-reduce
+        #      concatenate partial outputs -> all-gather
         for i in range(1, config.tensor_parallel_size):
             event = ctx.Event()
             process = ctx.Process(target=ModelRunner, args=(config, i, event))
@@ -46,6 +56,8 @@ class LLMEngine:
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
+            # .join() blocks the caller until the target process exits.
+            # It actually only waits until child processes finish, not terminate them immediately.
             p.join()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):

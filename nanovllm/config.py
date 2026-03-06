@@ -6,15 +6,15 @@ from transformers import AutoConfig
 @dataclass
 class Config:
     model: str
-    # Max total num of tokens that can be processed in a single batch, just for
-    # prefill, since decode's seq_len = 1.
+    # A hard cap on the total number of tokens processed in one "batch step"
+    # across all active sequences.
     max_num_batched_tokens: int = 16384
-    # Max num of sequences that can be in-flight at the same time, both prefill
-    # and decode. For example, during decode, each sequence generates one token
-    # per step, so a batch of 512 sequences will generate 512 tokens per step,
-    # which means there are 512 forward passes fused into one.
+    # The maximum number of concurrent sequences (requests) the engine will keep
+    # "active" in scheduler at the same time.
+    # FYI, a sequence is one independent token stream with its own KV cache.
     max_num_seqs: int = 512
-    # Total length/tokens of a sequence/request (prompt + generated tokens) cannot exceed this value.
+    # prompt tokens + generated tokens <= max_model_len.
+    # Applies per sequence, not per batch.
     max_model_len: int = 4096
     # Fraction of GPU memory allowed to use. The remaining 90% is reserved and
     # split between model weights (fixed) and KV cache (dynamic, grows as generation goes on).
