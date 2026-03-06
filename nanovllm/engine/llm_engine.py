@@ -57,6 +57,7 @@ class LLMEngine:
         del self.model_runner
         for p in self.ps:
             # .join() blocks the caller until the target process exits.
+            # It actually only waits until child processes finish, not terminate them immediately.
             p.join()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
