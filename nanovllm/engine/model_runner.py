@@ -23,13 +23,15 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        # 1. Initialize distributed (NCCL) - even for single GPU here (world_size=1)
+        # 1. Initialize distributed (NCCL) - this is a collective operations,
+        #    all ranks must call it before release the barrier.
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         # 2. Set default dtype and device, then build model skeleton.
         default_dtype = torch.get_default_dtype() # e.g., bfloat16
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
+        # 2.1 Build model skeleton:
         # PyTorch can NOT load model directly into layers, it first needs to
         # know the shape of each weight tensor.
         self.model = Qwen3ForCausalLM(hf_config) # empty model, weights will be loaded later.

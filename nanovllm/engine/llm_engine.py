@@ -21,6 +21,8 @@ class LLMEngine:
         config = Config(model, **config_kwargs)
         # Init worker processes (do the work) and their sync events (coordinate the work).
         self.ps = []
+        # ctx.Event() provides a shared SIGNAL only that process can choose to
+        # wait for, check, or react to.
         self.events = []
         # spawn starts a fresh Python interpreter and imports everything from
         # scratch, which is required for CUDA. fork and forkserver won't work
@@ -35,7 +37,20 @@ class LLMEngine:
         #      concatenate partial outputs -> all-gather
         for i in range(1, config.tensor_parallel_size):
             event = ctx.Event()
+            # Start a separate worker process, and in that process, call this
+            # callable (ModelRunner) with these arguments (config, i, event)
             process = ctx.Process(target=ModelRunner, args=(config, i, event))
+            # worker process has to start first, due to under the
+            # ModelRunner.__init__(), the dist.init_process_group() is a
+            # collective operation, it blocks until all ranks have called it. So
+            # the flow is:
+            # (1) Worker processes (rank 1, 2, ...) are spawned and
+            # start executing ModelRunner.__init__(). They each call
+            # dist.init_process_group() and block, waiting for all other ranks
+            # to join.
+            # (2) Rank 0 calls ModelRunner.init(), now all ranks have
+            # joined, so the barrier is released and all ranks processed
+            # together.
             process.start()
             self.ps.append(process)
             self.events.append(event)

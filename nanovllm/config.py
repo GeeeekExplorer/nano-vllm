@@ -21,8 +21,19 @@ class Config:
     gpu_memory_utilization: float = 0.9
     # Number of GPUs to shard the model across.
     tensor_parallel_size: int = 1
-    # if True, skip CUDA graph capture and always run eagerly. If False,
-    # pre-capture CUDA graphs for decode.
+    # if True, skip CUDA graph capture and always run eagerly (normal PyTorch
+    # execution). If False, pre-recorded GPU execution for faster decode.
+    # In eager mode, every token step does sth like:
+    # (1) CPU schedules ops
+    # (2) PyTorch launches a bunch of GPU kernels
+    # (3) Each launch has overhead (Python + framework + driver)
+    # (4) Repeat for the next token
+    # In decode, you might do this THOUSANDS of times (one token at a time)
+    # CUDA gGraphs let you:
+    # (1) Run one decode step once to record the exact GPU kernel sequence
+    # (2) Save it as a "graph"
+    # (3) For each subsequent token step, just replay the graph.
+    # This reduces CPU overhead and improves GPU utilization.
     enforce_eager: bool = False
     # The rest of the system needs architecture details such as
     # num_hidden_layers, hidden_size, num_attention_heads, num_key_value_heads,

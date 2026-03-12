@@ -182,6 +182,7 @@ class Qwen3Model(nn.Module):
         return hidden_states
 
 
+# Causal means the model can only look left (backward) when predicting the next token
 class Qwen3ForCausalLM(nn.Module):
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
