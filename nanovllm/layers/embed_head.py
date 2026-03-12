@@ -10,26 +10,34 @@ class VocabParallelEmbedding(nn.Module):
 
     def __init__(
         self,
-        num_embeddings: int,
-        embedding_dim: int,
+        num_embeddings: int, # 151936 for QWen3
+        embedding_dim: int,  # 1024 for QWen3
     ):
         super().__init__()
+        # tp -> tensor parallelism
+        # which GPU am I
         self.tp_rank = dist.get_rank()
+        # how many GPUs total
         self.tp_size = dist.get_world_size()
+        # The vocabulary size must be evenly divisible by the number of GPUs,
+        # otherwise we can not split it equally.
         assert num_embeddings % self.tp_size == 0
         self.num_embeddings = num_embeddings
         self.num_embeddings_per_partition = self.num_embeddings // self.tp_size
         self.vocab_start_idx = self.num_embeddings_per_partition * self.tp_rank
         self.vocab_end_idx = self.vocab_start_idx + self.num_embeddings_per_partition
+        # Wraps the tensor so that PyTorch can properly initialize it and register it as a parameter.
+        # torch.empty allocates memory without initializing values.
         self.weight = nn.Parameter(torch.empty(self.num_embeddings_per_partition, embedding_dim))
         self.weight.weight_loader = self.weight_loader
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
-        shard_size = param_data.size(0)
+        shard_size = param_data.size(0) # 37984 if 4 GPUs (151936 / 4)
         start_idx = self.tp_rank * shard_size
+        # Slice rows, tensor.narrow(dim, start, length)
         loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)
-        param_data.copy_(loaded_weight)
+        param_data.copy_(loaded_weight) # Copy into GPU memory
 
     def forward(self, x: torch.Tensor):
         if self.tp_size > 1:
