@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from transformers import AutoConfig
 
 
@@ -13,7 +13,7 @@ class Config:
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
     hf_config: AutoConfig | None = None
-    eos: int = -1
+    eos: list[int] = field(default_factory=list)
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
 
@@ -24,3 +24,5 @@ class Config:
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         assert self.max_num_batched_tokens >= self.max_model_len
+        eos = self.hf_config.eos_token_id
+        self.eos = eos if isinstance(eos, list) else [eos]
