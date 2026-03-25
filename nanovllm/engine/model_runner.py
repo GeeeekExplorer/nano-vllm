@@ -186,9 +186,21 @@ class ModelRunner:
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
 
+    def can_use_decode_graph(self, input_ids: torch.Tensor, is_prefill: bool) -> bool:
+        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+            return False
+        context = get_context()
+        if context.context_lens is None or context.block_tables is None:
+            return False
+        if int(context.context_lens.max().item()) > self.config.max_seq_len_to_capture:
+            return False
+        if context.block_tables.size(1) > self.graph_vars["block_tables"].size(1):
+            return False
+        return True
+
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+        if not self.can_use_decode_graph(input_ids, is_prefill):
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
@@ -219,9 +231,7 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
-        # Runtime decode replay can require one more block-table column than the
-        # nominal max_model_len/block_size width captured here.
-        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size + 1
+        max_num_blocks = (config.max_seq_len_to_capture + self.block_size - 1) // self.block_size + 1
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
