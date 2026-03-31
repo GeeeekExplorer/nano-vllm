@@ -59,7 +59,7 @@ llm = LLM(
 # tensorboard --logdir=./profiler_logs
 ```
 
-The profiler traces are saved per rank (e.g., `rank0`, `rank1`) and can be analyzed using TensorBoard to identify performance bottlenecks in multi-process inference.
+The profiler traces are saved per rank (e.g., `rank0`, `rank1`) and can be analyzed using https://ui.perfetto.dev/ to identify performance bottlenecks in multi-process inference.
 
 ## Benchmark
 
