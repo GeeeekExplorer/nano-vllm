@@ -1,4 +1,6 @@
+import os
 import pickle
+from contextlib import nullcontext
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -14,7 +16,7 @@ from nanovllm.utils.loader import load_model
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(self, config: Config, rank: int, event: Event | list[Event], enable_profiling: bool = False, profiling_output_dir: str = "./profiler_logs"):
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
@@ -22,6 +24,9 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.enable_profiling = enable_profiling
+        self.profiling_output_dir = profiling_output_dir
+        self.profiler = None
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -38,6 +43,10 @@ class ModelRunner:
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
+        # Setup profiler after model is ready
+        if self.enable_profiling:
+            self._setup_profiler()
+
         if self.world_size > 1:
             if rank == 0:
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
@@ -47,7 +56,44 @@ class ModelRunner:
                 self.shm = SharedMemory(name="nanovllm")
                 self.loop()
 
+    def _setup_profiler(self):
+        """Setup PyTorch profiler for performance tracing."""
+        import torch.profiler
+        import os
+
+        os.makedirs(self.profiling_output_dir, exist_ok=True)
+        worker_name = f"rank{self.rank}"
+
+        profiler_schedule = torch.profiler.schedule(
+            wait=1,
+            warmup=1,
+            active=3,
+            repeat=1,
+        )
+
+        self.profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=profiler_schedule,
+            # 建议开启 record_shapes 和 profile_memory 以获得更详细的分析
+            record_shapes=True, 
+            profile_memory=True,
+            with_stack=True,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                self.profiling_output_dir,
+                worker_name=worker_name,
+            ),
+        )
+        # 添加标志位，防止重复启动
+        self.profiler_started = False
+        print(f"[Rank {self.rank}] Profiler enabled. Traces will be saved to: {self.profiling_output_dir}")
+
     def exit(self):
+        # Stop profiler before exit
+        if self.profiler is not None:
+            self.profiler.stop()
         if self.world_size > 1:
             self.shm.close()
             dist.barrier()
@@ -206,12 +252,29 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        # 1. 懒加载启动：在第一次推理时启动 profiler
+        # 这样可以避免抓取初始化时的开销，只抓取实际推理过程
+        if self.profiler is not None and not self.profiler_started:
+            self.profiler.start()
+            self.profiler_started = True
+
+        # 2. 正常执行推理逻辑（移除 with 语句）
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        
         reset_context()
+
+        # 3. 推进 Schedule
+        # 根据 wait=1, warmup=1, active=3 的配置，
+        # 前 2 次调用 step() 不会记录，后 3 次会记录，之后自动停止记录
+        if self.profiler is not None:
+            self.profiler.step()
+            
         return token_ids
+
 
     @torch.inference_mode()
     def capture_cudagraph(self):
