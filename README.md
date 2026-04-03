@@ -42,6 +42,10 @@ prompts = ["Hello, Nano-vLLM."]
 outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
+You can also enable nucleus sampling by setting `top_p`:
+```python
+sampling_params = SamplingParams(temperature=0.6, top_p=0.9, max_tokens=256)
+```
 
 ## Benchmark
 
