@@ -28,6 +28,7 @@ class Sequence:
         self.top_p = sampling_params.top_p
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        self.scheduled_prefill_tokens = 0
 
     def __len__(self):
         return self.num_tokens
@@ -73,12 +74,20 @@ class Sequence:
         self.num_tokens += 1
 
     def __getstate__(self):
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
-                self.token_ids if self.num_completion_tokens == 0 else self.last_token)
+        return (
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.block_table,
+            self.scheduled_prefill_tokens,
+            self.token_ids if self.num_completion_tokens == 0 else self.last_token,
+        )
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:-1]
+        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:4]
+        self.scheduled_prefill_tokens = state[4] if len(state) == 6 else 0
+        payload = state[-1]
         if self.num_completion_tokens == 0:
-            self.token_ids = state[-1]
+            self.token_ids = payload
         else:
-            self.last_token = state[-1]
+            self.last_token = payload
