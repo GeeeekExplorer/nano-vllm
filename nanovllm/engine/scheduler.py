@@ -1,8 +1,22 @@
 from collections import deque
+from dataclasses import dataclass
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
+
+
+@dataclass
+class ScheduledItem:
+    seq: Sequence
+    num_query_tokens: int
+    should_sample: bool
+    is_decode: bool
+
+
+@dataclass
+class ScheduleBatch:
+    items: list[ScheduledItem]
 
 
 class Scheduler:
@@ -10,6 +24,7 @@ class Scheduler:
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
+        self.enable_continuous_batching = config.enable_continuous_batching
         self.enable_chunked_prefill = config.enable_chunked_prefill
         self.chunked_prefill_size = config.chunked_prefill_size
         self.schedule_decode_next = False
@@ -24,8 +39,96 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.waiting.append(seq)
 
-    def schedule_prefill(self) -> list[Sequence]:
-        scheduled_seqs = []
+    def schedule(self) -> ScheduleBatch:
+        if self.enable_continuous_batching:
+            return self._schedule_continuous()
+        return self._schedule_legacy()
+
+    def _schedule_continuous(self) -> ScheduleBatch:
+        scheduled_items = []
+        scheduled_seq_ids = set()
+        scheduled_running = []
+        num_seqs = 0
+        num_batched_tokens = 0
+
+        # Decode is latency-sensitive. Schedule one token for active sequences first.
+        while self.running and num_seqs < self.max_num_seqs and num_batched_tokens < self.max_num_batched_tokens:
+            seq = self.running.popleft()
+            if seq.seq_id in scheduled_seq_ids:
+                continue
+            if seq.num_computed_tokens >= len(seq):
+                seq.num_computed_tokens = len(seq) - 1
+            while not self.block_manager.can_append(seq):
+                if self.running:
+                    self.preempt(self.running.pop())
+                else:
+                    self.preempt(seq)
+                    seq = None
+                    break
+            if seq is None:
+                break
+            self.block_manager.may_append(seq)
+            seq.status = SequenceStatus.RUNNING
+            seq.scheduled_tokens = 1
+            scheduled_items.append(ScheduledItem(seq, 1, True, True))
+            scheduled_running.append(seq)
+            scheduled_seq_ids.add(seq.seq_id)
+            num_seqs += 1
+            num_batched_tokens += 1
+
+        # Round-robin decode fairness: scheduled sequences go to the tail.
+        self.running.extend(scheduled_running)
+
+        # Fill leftover budget with waiting/recompute chunks.
+        while self.waiting and num_seqs < self.max_num_seqs and num_batched_tokens < self.max_num_batched_tokens:
+            seq = self.waiting[0]
+            if seq.seq_id in scheduled_seq_ids:
+                break
+            allocated = False
+            if not seq.block_table:
+                if not self.block_manager.can_allocate(seq):
+                    break
+                self.block_manager.allocate(seq)
+                allocated = True
+
+            num_remaining_tokens = len(seq) - seq.num_computed_tokens
+            if num_remaining_tokens <= 0:
+                # Even with full prefix cache hits, one-token decode is still needed
+                # to produce the next-token logits.
+                seq.num_computed_tokens = len(seq) - 1
+                num_remaining_tokens = 1
+
+            num_budget_tokens = self.max_num_batched_tokens - num_batched_tokens
+            if num_budget_tokens <= 0:
+                break
+            num_query_tokens = min(num_remaining_tokens, num_budget_tokens)
+            if self.enable_chunked_prefill:
+                num_query_tokens = min(num_query_tokens, self.chunked_prefill_size)
+
+            if num_query_tokens <= 0:
+                if allocated:
+                    self.block_manager.deallocate(seq)
+                break
+
+            self.waiting.popleft()
+            seq.scheduled_tokens = num_query_tokens
+            should_sample = seq.num_computed_tokens + num_query_tokens >= len(seq)
+            seq.status = SequenceStatus.RUNNING if should_sample else SequenceStatus.WAITING
+            if should_sample:
+                self.running.append(seq)
+            else:
+                self.waiting.append(seq)
+            scheduled_items.append(ScheduledItem(seq, num_query_tokens, should_sample, False))
+            scheduled_seq_ids.add(seq.seq_id)
+            num_seqs += 1
+            num_batched_tokens += num_query_tokens
+
+        if not scheduled_items:
+            raise RuntimeError("scheduler has no runnable sequences")
+        return ScheduleBatch(scheduled_items)
+
+    def _schedule_prefill_legacy(self) -> list[ScheduledItem]:
+        scheduled_items = []
         scheduled_seq_ids = set()
         num_seqs = 0
         num_batched_tokens = 0
@@ -39,45 +142,51 @@ class Scheduler:
                     break
                 self.block_manager.allocate(seq)
                 allocated = True
-            num_remaining_prompt_tokens = seq.num_prompt_tokens - seq.num_cached_tokens
+
+            num_remaining_prompt_tokens = seq.num_prompt_tokens - seq.num_computed_tokens
             if num_remaining_prompt_tokens <= 0:
                 self.waiting.popleft()
                 scheduled_seq_ids.add(seq.seq_id)
+                seq.status = SequenceStatus.RUNNING
                 self.running.append(seq)
                 continue
-            num_scheduled_prefill_tokens = num_remaining_prompt_tokens
+
+            num_query_tokens = num_remaining_prompt_tokens
             if self.enable_chunked_prefill:
                 num_budget_tokens = self.max_num_batched_tokens - num_batched_tokens
                 if num_budget_tokens <= 0:
                     break
-                num_scheduled_prefill_tokens = min(
-                    num_scheduled_prefill_tokens,
+                num_query_tokens = min(
+                    num_query_tokens,
                     self.chunked_prefill_size,
                     num_budget_tokens,
                 )
-            if num_scheduled_prefill_tokens <= 0 or num_batched_tokens + num_scheduled_prefill_tokens > self.max_num_batched_tokens:
+            if num_query_tokens <= 0 or num_batched_tokens + num_query_tokens > self.max_num_batched_tokens:
                 if allocated:
                     self.block_manager.deallocate(seq)
                 break
+
             num_seqs += 1
-            num_batched_tokens += num_scheduled_prefill_tokens
+            num_batched_tokens += num_query_tokens
             self.waiting.popleft()
             scheduled_seq_ids.add(seq.seq_id)
-            seq.status = SequenceStatus.RUNNING
-            seq.scheduled_prefill_tokens = num_scheduled_prefill_tokens
-            scheduled_seqs.append(seq)
-            if seq.num_cached_tokens + num_scheduled_prefill_tokens < seq.num_prompt_tokens:
-                seq.status = SequenceStatus.WAITING
-                self.waiting.append(seq)
-            else:
+            should_sample = seq.num_computed_tokens + num_query_tokens >= seq.num_prompt_tokens
+            seq.scheduled_tokens = num_query_tokens
+            seq.status = SequenceStatus.RUNNING if should_sample else SequenceStatus.WAITING
+            scheduled_items.append(ScheduledItem(seq, num_query_tokens, should_sample, False))
+            if should_sample:
                 self.running.append(seq)
-        return scheduled_seqs
+            else:
+                self.waiting.append(seq)
+        return scheduled_items
 
-    def schedule_decode(self) -> list[Sequence]:
-        scheduled_seqs = []
+    def _schedule_decode_legacy(self) -> list[ScheduledItem]:
+        scheduled_items = []
         num_seqs = 0
         while self.running and num_seqs < self.max_num_seqs:
             seq = self.running.popleft()
+            if seq.num_computed_tokens >= len(seq):
+                seq.num_computed_tokens = len(seq) - 1
             while not self.block_manager.can_append(seq):
                 if self.running:
                     self.preempt(self.running.pop())
@@ -87,51 +196,55 @@ class Scheduler:
             else:
                 num_seqs += 1
                 self.block_manager.may_append(seq)
-                scheduled_seqs.append(seq)
-        if not scheduled_seqs:
+                seq.status = SequenceStatus.RUNNING
+                seq.scheduled_tokens = 1
+                scheduled_items.append(ScheduledItem(seq, 1, True, True))
+        if not scheduled_items:
             return []
-        self.running.extendleft(reversed(scheduled_seqs))
-        return scheduled_seqs
+        self.running.extendleft(reversed([item.seq for item in scheduled_items]))
+        return scheduled_items
 
-    def schedule(self) -> tuple[list[Sequence], bool]:
+    def _schedule_legacy(self) -> ScheduleBatch:
         if self.enable_chunked_prefill and self.waiting and self.running:
             if self.schedule_decode_next:
-                scheduled_seqs = self.schedule_decode()
-                if scheduled_seqs:
+                scheduled_items = self._schedule_decode_legacy()
+                if scheduled_items:
                     self.schedule_decode_next = False
-                    return scheduled_seqs, False
-            scheduled_seqs = self.schedule_prefill()
-            if scheduled_seqs:
+                    return ScheduleBatch(scheduled_items)
+            scheduled_items = self._schedule_prefill_legacy()
+            if scheduled_items:
                 self.schedule_decode_next = True
-                return scheduled_seqs, True
-            scheduled_seqs = self.schedule_decode()
-            if scheduled_seqs:
+                return ScheduleBatch(scheduled_items)
+            scheduled_items = self._schedule_decode_legacy()
+            if scheduled_items:
                 self.schedule_decode_next = False
-                return scheduled_seqs, False
+                return ScheduleBatch(scheduled_items)
         else:
-            scheduled_seqs = self.schedule_prefill()
-            if scheduled_seqs:
-                return scheduled_seqs, True
-            scheduled_seqs = self.schedule_decode()
-            if scheduled_seqs:
-                return scheduled_seqs, False
+            scheduled_items = self._schedule_prefill_legacy()
+            if scheduled_items:
+                return ScheduleBatch(scheduled_items)
+            scheduled_items = self._schedule_decode_legacy()
+            if scheduled_items:
+                return ScheduleBatch(scheduled_items)
         raise RuntimeError("scheduler has no runnable sequences")
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
+        seq.scheduled_tokens = 0
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool) -> list[bool]:
-        for seq, token_id in zip(seqs, token_ids):
-            if is_prefill and seq.scheduled_prefill_tokens > 0:
-                seq.num_cached_tokens += seq.scheduled_prefill_tokens
-                seq.scheduled_prefill_tokens = 0
-                if seq.num_cached_tokens < seq.num_prompt_tokens:
-                    seq.status = SequenceStatus.WAITING
-                    continue
+    def postprocess(self, batch: ScheduleBatch, token_ids: list[int]):
+        for item, token_id in zip(batch.items, token_ids):
+            seq = item.seq
+            seq.num_computed_tokens += item.num_query_tokens
+            seq.scheduled_tokens = 0
+            if not item.should_sample:
+                seq.status = SequenceStatus.WAITING
+                continue
             seq.append_token(token_id)
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
-                self.running.remove(seq)
+                if seq in self.running:
+                    self.running.remove(seq)

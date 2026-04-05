@@ -22,19 +22,29 @@ class Sequence:
         self.last_token = token_ids[-1]
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
-        self.num_cached_tokens = 0
+        self.num_computed_tokens = 0
         self.block_table = []
         self.temperature = sampling_params.temperature
         self.top_p = sampling_params.top_p
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
-        self.scheduled_prefill_tokens = 0
+        self.scheduled_tokens = 0
 
     def __len__(self):
         return self.num_tokens
 
     def __getitem__(self, key):
-        return self.token_ids[key]
+        token_ids = getattr(self, "token_ids", None)
+        if token_ids is not None:
+            return token_ids[key]
+        if isinstance(key, int):
+            if key in (self.num_tokens - 1, -1):
+                return self.last_token
+        elif isinstance(key, slice):
+            start, stop, step = key.indices(self.num_tokens)
+            if step == 1 and start == self.num_tokens - 1 and stop == self.num_tokens:
+                return [self.last_token]
+        raise RuntimeError("token ids are unavailable for the requested index")
 
     @property
     def is_finished(self):
@@ -54,7 +64,7 @@ class Sequence:
 
     @property
     def num_cached_blocks(self):
-        return self.num_cached_tokens // self.block_size
+        return self.num_computed_tokens // self.block_size
 
     @property
     def num_blocks(self):
@@ -74,20 +84,43 @@ class Sequence:
         self.num_tokens += 1
 
     def __getstate__(self):
+        needs_full_tokens = (
+            self.scheduled_tokens != 1
+            or self.num_computed_tokens != self.num_tokens - 1
+            or not self.block_table
+        )
         return (
             self.num_tokens,
             self.num_prompt_tokens,
-            self.num_cached_tokens,
+            self.num_computed_tokens,
             self.block_table,
-            self.scheduled_prefill_tokens,
-            self.token_ids if self.num_completion_tokens == 0 else self.last_token,
+            self.scheduled_tokens,
+            needs_full_tokens,
+            self.token_ids if needs_full_tokens else self.last_token,
         )
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:4]
-        self.scheduled_prefill_tokens = state[4] if len(state) == 6 else 0
+        self.num_tokens, self.num_prompt_tokens, self.num_computed_tokens, self.block_table = state[:4]
+        if len(state) == 7:
+            self.scheduled_tokens = state[4]
+            needs_full_tokens = state[5]
+            payload = state[6]
+            if needs_full_tokens:
+                self.token_ids = payload
+                self.last_token = payload[-1]
+            else:
+                self.last_token = payload
+                if hasattr(self, "token_ids"):
+                    del self.token_ids
+            return
+
+        # Backward compatibility for older pickled states.
+        self.scheduled_tokens = state[4] if len(state) == 6 else 0
         payload = state[-1]
         if self.num_completion_tokens == 0:
             self.token_ids = payload
+            self.last_token = payload[-1]
         else:
             self.last_token = payload
+            if hasattr(self, "token_ids"):
+                del self.token_ids

@@ -70,7 +70,7 @@ class BlockManager:
                 block_id = self.free_block_ids[0]
                 block = self._allocate_block(block_id)
             else:
-                seq.num_cached_tokens += self.block_size
+                seq.num_computed_tokens += self.block_size
                 if block_id in self.used_block_ids:
                     block = self.blocks[block_id]
                     block.ref_count += 1
@@ -87,7 +87,7 @@ class BlockManager:
             block.ref_count -= 1
             if block.ref_count == 0:
                 self._deallocate_block(block_id)
-        seq.num_cached_tokens = 0
+        seq.num_computed_tokens = 0
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:

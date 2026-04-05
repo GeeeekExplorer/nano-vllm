@@ -50,17 +50,26 @@ class LLMEngine:
         return seq
 
     def step(self, return_metadata: bool = False):
-        seqs, is_prefill = self.scheduler.schedule()
-        scheduled_prefill_tokens = [seq.scheduled_prefill_tokens for seq in seqs]
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        num_tokens = sum(scheduled_prefill_tokens) if is_prefill else -len(seqs)
+        batch = self.scheduler.schedule()
+        token_ids = self.model_runner.call("run", batch)
+        self.scheduler.postprocess(batch, token_ids)
+        outputs = [(item.seq.seq_id, item.seq.completion_token_ids) for item in batch.items if item.seq.is_finished]
+        num_prefill_tokens = sum(item.num_query_tokens for item in batch.items if not item.is_decode)
+        num_decode_tokens = sum(item.num_query_tokens for item in batch.items if item.is_decode)
+        num_tokens = num_prefill_tokens - num_decode_tokens
         if return_metadata:
+            has_prefill = any(not item.is_decode for item in batch.items)
+            has_decode = any(item.is_decode for item in batch.items)
+            legacy_is_prefill = has_prefill and not has_decode
             metadata = {
-                "is_prefill": is_prefill,
-                "seq_ids": [seq.seq_id for seq in seqs],
-                "scheduled_prefill_tokens": scheduled_prefill_tokens,
+                "seq_ids": [item.seq.seq_id for item in batch.items],
+                "scheduled_query_tokens": [item.num_query_tokens for item in batch.items],
+                "should_sample": [item.should_sample for item in batch.items],
+                "is_decode": [item.is_decode for item in batch.items],
+                "num_prefill_tokens": num_prefill_tokens,
+                "num_decode_tokens": num_decode_tokens,
+                "is_prefill": legacy_is_prefill if not self.scheduler.enable_continuous_batching else None,
+                "scheduled_prefill_tokens": [item.num_query_tokens if not item.is_decode else 0 for item in batch.items],
             }
             return outputs, num_tokens, metadata
         return outputs, num_tokens
@@ -84,12 +93,13 @@ class LLMEngine:
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():
             t = perf_counter()
-            output, num_tokens = self.step()
+            output, _, metadata = self.step(return_metadata=True)
             if use_tqdm:
-                if num_tokens > 0:
-                    prefill_throughput = num_tokens / (perf_counter() - t)
-                else:
-                    decode_throughput = -num_tokens / (perf_counter() - t)
+                dt = perf_counter() - t
+                if metadata["num_prefill_tokens"] > 0:
+                    prefill_throughput = metadata["num_prefill_tokens"] / dt
+                if metadata["num_decode_tokens"] > 0:
+                    decode_throughput = metadata["num_decode_tokens"] / dt
                 pbar.set_postfix({
                     "Prefill": f"{int(prefill_throughput)}tok/s",
                     "Decode": f"{int(decode_throughput)}tok/s",
