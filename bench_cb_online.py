@@ -313,7 +313,8 @@ def parse_args():
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--max-num-seqs", type=int, default=512)
     parser.add_argument("--max-num-batched-tokens", type=int, default=16384)
-    parser.add_argument("--enable-chunked-prefill", action="store_true")
+    # Kept for CLI backward compatibility; comparison mode now forces off/off vs on/on.
+    parser.add_argument("--enable-chunked-prefill", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--chunked-prefill-size", type=int, default=2048)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--enforce-eager", action="store_true")
@@ -347,7 +348,6 @@ def main():
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
-        enable_chunked_prefill=args.enable_chunked_prefill,
         chunked_prefill_size=args.chunked_prefill_size,
         tensor_parallel_size=args.tensor_parallel_size,
         enforce_eager=args.enforce_eager,
@@ -355,15 +355,15 @@ def main():
         gpu_id=args.gpu_id,
     )
 
-    print("Running CB_OFF ...")
-    off = run_once(enable_cb=False, **common_kwargs)
+    print("Running CB_OFF + CHUNKED_PREFILL_OFF ...")
+    off = run_once(enable_cb=False, enable_chunked_prefill=False, **common_kwargs)
 
     import gc, torch
     gc.collect()
     torch.cuda.empty_cache()
 
-    print("Running CB_ON ...")
-    on = run_once(enable_cb=True, **common_kwargs)
+    print("Running CB_ON + CHUNKED_PREFILL_ON ...")
+    on = run_once(enable_cb=True, enable_chunked_prefill=True, **common_kwargs)
 
     print_report(off, on)
 
