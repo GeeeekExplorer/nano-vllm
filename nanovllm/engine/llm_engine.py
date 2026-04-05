@@ -56,7 +56,12 @@ class LLMEngine:
         outputs = [(item.seq.seq_id, item.seq.completion_token_ids) for item in batch.items if item.seq.is_finished]
         num_prefill_tokens = sum(item.num_query_tokens for item in batch.items if not item.is_decode)
         num_decode_tokens = sum(item.num_query_tokens for item in batch.items if item.is_decode)
-        num_tokens = num_prefill_tokens - num_decode_tokens
+        num_total_tokens = num_prefill_tokens + num_decode_tokens
+        if self.scheduler.enable_continuous_batching:
+            num_tokens = num_total_tokens
+        else:
+            # Keep the legacy signed convention in non-CB mode.
+            num_tokens = num_prefill_tokens if num_decode_tokens == 0 else -num_decode_tokens
         if return_metadata:
             has_prefill = any(not item.is_decode for item in batch.items)
             has_decode = any(item.is_decode for item in batch.items)
@@ -68,6 +73,7 @@ class LLMEngine:
                 "is_decode": [item.is_decode for item in batch.items],
                 "num_prefill_tokens": num_prefill_tokens,
                 "num_decode_tokens": num_decode_tokens,
+                "num_total_tokens": num_total_tokens,
                 "is_prefill": legacy_is_prefill if not self.scheduler.enable_continuous_batching else None,
                 "scheduled_prefill_tokens": [item.num_query_tokens if not item.is_decode else 0 for item in batch.items],
             }
