@@ -357,6 +357,11 @@ def main():
 
     print("Running CB_OFF ...")
     off = run_once(enable_cb=False, **common_kwargs)
+
+    import gc, torch
+    gc.collect()
+    torch.cuda.empty_cache()
+
     print("Running CB_ON ...")
     on = run_once(enable_cb=True, **common_kwargs)
 
