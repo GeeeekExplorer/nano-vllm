@@ -39,6 +39,15 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.waiting.append(seq)
 
+    def _promote_resumable_waiting(self, scheduled_seq_ids: set[int] | None = None) -> bool:
+        for idx, seq in enumerate(self.waiting):
+            if scheduled_seq_ids is not None and seq.seq_id in scheduled_seq_ids:
+                continue
+            if seq.block_table:
+                self.waiting.rotate(-idx)
+                return True
+        return False
+
     def schedule(self) -> ScheduleBatch:
         if self.enable_continuous_batching:
             return self._schedule_continuous()
@@ -87,6 +96,8 @@ class Scheduler:
             allocated = False
             if not seq.block_table:
                 if not self.block_manager.can_allocate(seq):
+                    if self._promote_resumable_waiting(scheduled_seq_ids):
+                        continue
                     break
                 self.block_manager.allocate(seq)
                 allocated = True
@@ -139,6 +150,8 @@ class Scheduler:
             allocated = False
             if not seq.block_table:
                 if not self.block_manager.can_allocate(seq):
+                    if self._promote_resumable_waiting(scheduled_seq_ids):
+                        continue
                     break
                 self.block_manager.allocate(seq)
                 allocated = True
