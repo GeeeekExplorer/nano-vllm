@@ -315,7 +315,7 @@ def run_once(
     return {
         "mode": mode_name,
         "num_requests": total_reqs,
-        "arrival_interval_ms": arrivals[1] * 1000.0 - arrivals[0] * 1000.0 if total_reqs > 1 else 0.0,
+        "arrival_interval_ms": ((arrivals[-1] - arrivals[0]) * 1000.0 / (total_reqs - 1)) if total_reqs > 1 else 0.0,
         "throughput_rps": total_reqs / makespan_s,
         "avg_ttft_ms": summary["avg_ttft_ms"],
         "avg_itl_ms_per_token": summary["avg_itl_ms_per_token"],
@@ -331,6 +331,18 @@ def run_once(
         "enable_continuous_batching": enable_cb,
         "enable_chunked_prefill": enable_chunked_prefill,
     }
+
+
+def run_once_guarded(**kwargs) -> dict:
+    mode_name = kwargs.get("mode_name", "unknown")
+    try:
+        return run_once(**kwargs)
+    except Exception as e:
+        msg = str(e)
+        if "out of memory" in msg.lower() or "cuda oom" in msg.lower():
+            print(f"[WARN] {mode_name} skipped due to OOM: {msg}")
+            return {"mode": mode_name, "error": msg}
+        raise
 
 
 def fmt(v: Optional[float], digits: int = 2) -> str:
@@ -356,6 +368,73 @@ def safe_delta(base: Optional[float], cur: Optional[float], lower_better: bool) 
         pct = (cur - base) / base * 100.0
     sign = "+" if pct >= 0 else ""
     return f"{sign}{pct:.2f}%"
+
+
+def parse_int_csv(raw: str) -> list[int]:
+    xs = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        xs.append(int(part))
+    return xs
+
+
+def is_nan_or_none(v: Optional[float]) -> bool:
+    if v is None:
+        return True
+    if isinstance(v, float) and (v != v):
+        return True
+    return False
+
+
+def dominates(base: dict, cand: dict) -> bool:
+    # Comprehensive dominance criteria for "CP+CB全面优化".
+    rules = [
+        ("throughput_rps", False),
+        ("avg_ttft_ms", True),
+        ("avg_itl_ms_per_token", True),
+        ("avg_latency_ms", True),
+        ("p95_latency_ms", True),
+        ("makespan_s", True),
+    ]
+    for key, lower_better in rules:
+        b = base[key]
+        c = cand[key]
+        if is_nan_or_none(b) or is_nan_or_none(c):
+            return False
+        if lower_better:
+            if c > b:
+                return False
+        else:
+            if c < b:
+                return False
+    return True
+
+
+def dominance_score(base: dict, cand: dict) -> float:
+    # Aggregate score: positive means "better overall".
+    rules = [
+        ("throughput_rps", False),
+        ("avg_ttft_ms", True),
+        ("avg_itl_ms_per_token", True),
+        ("avg_latency_ms", True),
+        ("p95_latency_ms", True),
+        ("makespan_s", True),
+    ]
+    score = 0.0
+    for key, lower_better in rules:
+        b = base[key]
+        c = cand[key]
+        if is_nan_or_none(b) or is_nan_or_none(c):
+            continue
+        if abs(b) < 1e-9:
+            continue
+        if lower_better:
+            score += (b - c) / b
+        else:
+            score += (c - b) / b
+    return score
 
 
 def print_workload_summary(requests: list[RequestSpec], arrivals: list[float], profile: str, pattern: str):
@@ -404,7 +483,7 @@ def print_matrix_report(results: dict[str, dict]):
     print("\n=== Matrix Comparison (CP/CB Value) ===")
     print(f"Requests: {baseline['num_requests']}, Mean arrival interval: {baseline['arrival_interval_ms']:.1f} ms")
     print("")
-    print(f"{'Mode':<12} {'Throughput':>12} {'Avg TTFT':>12} {'Avg Lat':>12} {'P95 Lat':>12} {'Makespan':>12}")
+    print(f"{'Mode':<12} {'Throughput':>12} {'Avg TTFT':>12} {'Avg ITL':>12} {'Avg Lat':>12} {'P95 Lat':>12} {'Makespan':>12}")
     print("-" * 74)
     order = ["off_off", "off_on", "on_off", "on_on"]
     for mode in order:
@@ -413,13 +492,14 @@ def print_matrix_report(results: dict[str, dict]):
             f"{mode:<12} "
             f"{fmt(r['throughput_rps']):>12} "
             f"{fmt(r['avg_ttft_ms']):>12} "
+            f"{fmt(r['avg_itl_ms_per_token']):>12} "
             f"{fmt(r['avg_latency_ms']):>12} "
             f"{fmt(r['p95_latency_ms']):>12} "
             f"{fmt(r['makespan_s']):>12}"
         )
 
     print("\n=== Gain vs OFF/OFF Baseline ===")
-    print(f"{'Variant':<16} {'Throughput':>14} {'Avg TTFT':>14} {'Avg Lat':>14} {'P95 Lat':>14} {'Makespan':>14}")
+    print(f"{'Variant':<16} {'Throughput':>14} {'Avg TTFT':>14} {'Avg ITL':>14} {'Avg Lat':>14} {'P95 Lat':>14} {'Makespan':>14}")
     print("-" * 90)
     variants = [
         ("CP only", "off_on"),
@@ -432,6 +512,7 @@ def print_matrix_report(results: dict[str, dict]):
             f"{label:<16} "
             f"{safe_delta(baseline['throughput_rps'], r['throughput_rps'], False):>14} "
             f"{safe_delta(baseline['avg_ttft_ms'], r['avg_ttft_ms'], True):>14} "
+            f"{safe_delta(baseline['avg_itl_ms_per_token'], r['avg_itl_ms_per_token'], True):>14} "
             f"{safe_delta(baseline['avg_latency_ms'], r['avg_latency_ms'], True):>14} "
             f"{safe_delta(baseline['p95_latency_ms'], r['p95_latency_ms'], True):>14} "
             f"{safe_delta(baseline['makespan_s'], r['makespan_s'], True):>14}"
@@ -452,6 +533,73 @@ def print_matrix_report(results: dict[str, dict]):
                 f"{safe_delta(base_t, cb_t, True):>12} "
                 f"{safe_delta(base_t, both_t, True):>12}"
             )
+
+
+def print_opt_report(base: dict, candidates: list[dict], best: dict, found_dominating: bool):
+    print("\n=== Optimize ON/ON vs OFF/OFF Baseline ===")
+    print("Goal: throughput up, and TTFT/ITL/latency/P95/makespan all down")
+    print("")
+    print(
+        f"{'Candidate':<20} {'Chunk':>8} {'BatchedTok':>10} "
+        f"{'Thrpt':>10} {'TTFT':>10} {'ITL':>10} {'P95':>10} {'Mkspan':>10} {'Dominates':>10}"
+    )
+    print("-" * 114)
+    for r in candidates:
+        print(
+            f"{r['mode']:<20} {r['chunked_prefill_size']:>8} {r['max_num_batched_tokens']:>10} "
+            f"{fmt(r['throughput_rps']):>10} {fmt(r['avg_ttft_ms']):>10} {fmt(r['avg_itl_ms_per_token']):>10} "
+            f"{fmt(r['p95_latency_ms']):>10} {fmt(r['makespan_s']):>10} "
+            f"{'YES' if r['dominates'] else 'NO':>10}"
+        )
+
+    print("\n=== Best Candidate ===")
+    print(
+        f"{best['mode']}, chunked_prefill_size={best['chunked_prefill_size']}, "
+        f"max_num_batched_tokens={best['max_num_batched_tokens']}, dominates={best['dominates']}"
+    )
+    print(
+        "Gain vs OFF/OFF: "
+        f"Thrpt {safe_delta(base['throughput_rps'], best['throughput_rps'], False)}, "
+        f"TTFT {safe_delta(base['avg_ttft_ms'], best['avg_ttft_ms'], True)}, "
+        f"ITL {safe_delta(base['avg_itl_ms_per_token'], best['avg_itl_ms_per_token'], True)}, "
+        f"P95 {safe_delta(base['p95_latency_ms'], best['p95_latency_ms'], True)}, "
+        f"Mkspan {safe_delta(base['makespan_s'], best['makespan_s'], True)}"
+    )
+    if found_dominating:
+        print("Result: Found at least one ON/ON candidate that comprehensively dominates OFF/OFF.")
+    else:
+        print("Result: No strict comprehensive dominance found in this search space.")
+
+
+def print_opt_search_report(scenarios: list[dict], global_best: dict, found_dominating: bool):
+    print("\n=== Multi-Interval Search Summary ===")
+    print(f"{'Interval(ms)':<14} {'BestCandidate':<20} {'Dominates':>10} {'Thrpt':>10} {'TTFT':>10} {'ITL':>10} {'P95':>10} {'Mkspan':>10}")
+    print("-" * 106)
+    for sc in scenarios:
+        base = sc["baseline"]
+        best = sc["best"]
+        print(
+            f"{sc['arrival_interval_ms']:<14} "
+            f"{best['mode']:<20} "
+            f"{'YES' if best['dominates'] else 'NO':>10} "
+            f"{safe_delta(base['throughput_rps'], best['throughput_rps'], False):>10} "
+            f"{safe_delta(base['avg_ttft_ms'], best['avg_ttft_ms'], True):>10} "
+            f"{safe_delta(base['avg_itl_ms_per_token'], best['avg_itl_ms_per_token'], True):>10} "
+            f"{safe_delta(base['p95_latency_ms'], best['p95_latency_ms'], True):>10} "
+            f"{safe_delta(base['makespan_s'], best['makespan_s'], True):>10}"
+        )
+
+    print("\n=== Global Best ===")
+    print(
+        f"interval={global_best['arrival_interval_ms']}ms, mode={global_best['mode']}, "
+        f"chunked_prefill_size={global_best['chunked_prefill_size']}, "
+        f"max_num_batched_tokens={global_best['max_num_batched_tokens']}, "
+        f"dominates={global_best['dominates']}"
+    )
+    if found_dominating:
+        print("Result: Found strict comprehensive dominance (throughput up, all key latencies down).")
+    else:
+        print("Result: No strict comprehensive dominance found; printed the best tradeoff candidate.")
 
 
 def cleanup_between_runs():
@@ -491,6 +639,11 @@ def parse_args():
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--compare-mode", choices=["pair", "matrix"], default="matrix")
+    parser.add_argument("--optimize-on-on", action="store_true")
+    parser.add_argument("--opt-arrival-interval-ms", type=str, default="")
+    parser.add_argument("--opt-chunked-prefill-sizes", type=str, default="256,512,768,1024,1536,2048")
+    parser.add_argument("--opt-max-num-batched-tokens", type=str, default="")
+    parser.add_argument("--opt-stop-on-first-dominating", action="store_true")
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--max-num-seqs", type=int, default=512)
     parser.add_argument("--max-num-batched-tokens", type=int, default=16384)
@@ -515,6 +668,150 @@ def main():
     else:
         assert args.short_prompt_len > 0 and args.long_prompt_len > 0, "prompt lens must be > 0"
         assert args.short_output_len > 0 and args.long_output_len > 0, "output lens must be > 0"
+
+    if args.optimize_on_on:
+        interval_list = parse_int_csv(args.opt_arrival_interval_ms)
+        if not interval_list:
+            interval_list = [args.arrival_interval_ms]
+        chunk_sizes = parse_int_csv(args.opt_chunked_prefill_sizes)
+        if not chunk_sizes:
+            chunk_sizes = [args.chunked_prefill_size]
+        max_batched_tokens_list = parse_int_csv(args.opt_max_num_batched_tokens)
+        if not max_batched_tokens_list:
+            max_batched_tokens_list = [args.max_num_batched_tokens]
+
+        assert all(x >= 0 for x in interval_list), "opt-arrival-interval-ms values must be >= 0"
+        assert all(x > 0 for x in chunk_sizes), "opt-chunked-prefill-sizes values must be > 0"
+        assert all(x > 0 for x in max_batched_tokens_list), "opt-max-num-batched-tokens values must be > 0"
+
+        scenarios = []
+        all_candidates = []
+        found_dominating_any = False
+
+        for interval_ms in interval_list:
+            local_args = argparse.Namespace(**vars(args))
+            local_args.arrival_interval_ms = interval_ms
+            requests, arrivals = build_workload(local_args)
+            print_workload_summary(requests, arrivals, local_args.workload_profile, local_args.arrival_pattern)
+
+            common_kwargs = dict(
+                model=local_args.model,
+                requests=requests,
+                arrivals=arrivals,
+                temperature=local_args.temperature,
+                top_p=local_args.top_p,
+                max_model_len=local_args.max_model_len,
+                max_num_seqs=local_args.max_num_seqs,
+                max_num_batched_tokens=local_args.max_num_batched_tokens,
+                chunked_prefill_size=local_args.chunked_prefill_size,
+                tensor_parallel_size=local_args.tensor_parallel_size,
+                enforce_eager=local_args.enforce_eager,
+                gpu_sample_interval_ms=local_args.gpu_sample_interval_ms,
+                gpu_id=local_args.gpu_id,
+            )
+
+            print(f"Running baseline off_off (CB=OFF, CP=OFF), arrival={interval_ms}ms ...")
+            baseline = run_once_guarded(
+                mode_name=f"off_off_i{interval_ms}",
+                enable_cb=False,
+                enable_chunked_prefill=False,
+                **common_kwargs,
+            )
+            if "error" in baseline:
+                raise RuntimeError(
+                    f"Baseline OOM at arrival_interval_ms={interval_ms}. "
+                    "Please reduce load or lower max-num-batched-tokens/max-num-seqs."
+                )
+            cleanup_between_runs()
+
+            candidates = []
+            for mbt in max_batched_tokens_list:
+                for csz in chunk_sizes:
+                    name = f"on_on_i{interval_ms}_c{csz}_b{mbt}"
+                    print(f"Running candidate {name} (CB=ON, CP=ON) ...")
+                    cand_kwargs = dict(common_kwargs)
+                    cand_kwargs["max_num_batched_tokens"] = mbt
+                    cand_kwargs["chunked_prefill_size"] = csz
+                    r = run_once_guarded(
+                        mode_name=name,
+                        enable_cb=True,
+                        enable_chunked_prefill=True,
+                        **cand_kwargs,
+                    )
+                    if "error" in r:
+                        cleanup_between_runs()
+                        continue
+                    r["chunked_prefill_size"] = csz
+                    r["max_num_batched_tokens"] = mbt
+                    r["arrival_interval_ms"] = interval_ms
+                    r["dominates"] = dominates(baseline, r)
+                    r["score"] = dominance_score(baseline, r)
+                    candidates.append(r)
+                    all_candidates.append(r)
+                    cleanup_between_runs()
+
+            if not candidates:
+                print(f"[WARN] No valid ON/ON candidate at arrival={interval_ms}ms (all failed/OOM).")
+                continue
+
+            dominating = [x for x in candidates if x["dominates"]]
+            if dominating:
+                best = max(dominating, key=lambda x: (x["throughput_rps"], x["score"]))
+                found_dominating = True
+            else:
+                best = max(candidates, key=lambda x: x["score"])
+                found_dominating = False
+            found_dominating_any = found_dominating_any or found_dominating
+
+            scenarios.append(
+                {
+                    "arrival_interval_ms": interval_ms,
+                    "baseline": baseline,
+                    "candidates": candidates,
+                    "best": best,
+                    "found_dominating": found_dominating,
+                }
+            )
+            print_opt_report(baseline, candidates, best, found_dominating)
+
+            if args.opt_stop_on_first_dominating and found_dominating:
+                break
+
+        if not scenarios:
+            raise RuntimeError("No optimization scenario completed successfully.")
+
+        if found_dominating_any:
+            dominating_all = [x for x in all_candidates if x["dominates"]]
+            global_best = max(dominating_all, key=lambda x: (x["throughput_rps"], x["score"]))
+        else:
+            global_best = max(all_candidates, key=lambda x: x["score"])
+
+        print_opt_search_report(scenarios, global_best, found_dominating_any)
+        print(
+            "\nReproduce best pair run with:\n"
+            "python bench_cb_online.py "
+            f"--model {args.model} "
+            f"--compare-mode pair "
+            f"--arrival-interval-ms {global_best['arrival_interval_ms']} "
+            f"--chunked-prefill-size {global_best['chunked_prefill_size']} "
+            f"--max-num-batched-tokens {global_best['max_num_batched_tokens']} "
+            f"--num-requests {args.num_requests} "
+            f"--workload-profile {args.workload_profile} "
+            f"--arrival-pattern {args.arrival_pattern}"
+        )
+
+        if args.output_json:
+            payload = {
+                "config": vars(args),
+                "scenarios": scenarios,
+                "global_best": global_best,
+                "found_dominating_any": found_dominating_any,
+                "timestamp": int(time.time()),
+            }
+            with open(args.output_json, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            print(f"\nSaved report to {args.output_json}")
+        return
 
     requests, arrivals = build_workload(args)
     print_workload_summary(requests, arrivals, args.workload_profile, args.arrival_pattern)
