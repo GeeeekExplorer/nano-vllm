@@ -210,6 +210,10 @@ def run_once(
     max_num_seqs: int,
     max_num_batched_tokens: int,
     chunked_prefill_size: int,
+    enable_cb_prefill_liveness: bool,
+    cb_prefill_reserve_ratio: float,
+    cb_prefill_min_tokens: int,
+    cb_prefill_min_seqs: int,
     tensor_parallel_size: int,
     enforce_eager: bool,
     gpu_sample_interval_ms: int,
@@ -223,6 +227,10 @@ def run_once(
         max_num_batched_tokens=max_num_batched_tokens,
         enable_chunked_prefill=enable_chunked_prefill,
         chunked_prefill_size=chunked_prefill_size,
+        enable_cb_prefill_liveness=enable_cb_prefill_liveness,
+        cb_prefill_reserve_ratio=cb_prefill_reserve_ratio,
+        cb_prefill_min_tokens=cb_prefill_min_tokens,
+        cb_prefill_min_seqs=cb_prefill_min_seqs,
         tensor_parallel_size=tensor_parallel_size,
         enforce_eager=enforce_eager,
     )
@@ -648,6 +656,10 @@ def parse_args():
     parser.add_argument("--max-num-seqs", type=int, default=512)
     parser.add_argument("--max-num-batched-tokens", type=int, default=16384)
     parser.add_argument("--chunked-prefill-size", type=int, default=1024)
+    parser.add_argument("--disable-cb-prefill-liveness", action="store_true")
+    parser.add_argument("--cb-prefill-reserve-ratio", type=float, default=0.2)
+    parser.add_argument("--cb-prefill-min-tokens", type=int, default=512)
+    parser.add_argument("--cb-prefill-min-seqs", type=int, default=1)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--gpu-sample-interval-ms", type=int, default=200)
@@ -658,10 +670,16 @@ def parse_args():
 
 def main():
     args = parse_args()
+    args.enable_cb_prefill_liveness = True
+    if args.disable_cb_prefill_liveness:
+        args.enable_cb_prefill_liveness = False
     assert args.num_requests > 0, "num-requests must be > 0"
     assert args.arrival_interval_ms >= 0, "arrival-interval-ms must be >= 0"
     assert args.max_num_seqs > 0, "max-num-seqs must be > 0"
     assert args.max_num_batched_tokens > 0, "max-num-batched-tokens must be > 0"
+    assert 0.0 <= args.cb_prefill_reserve_ratio <= 1.0, "cb-prefill-reserve-ratio must be in [0, 1]"
+    assert args.cb_prefill_min_tokens >= 0, "cb-prefill-min-tokens must be >= 0"
+    assert args.cb_prefill_min_seqs >= 0, "cb-prefill-min-seqs must be >= 0"
     if args.workload_profile == "uniform":
         assert args.prompt_len > 0, "prompt-len must be > 0"
         assert args.output_len > 0, "output-len must be > 0"
@@ -704,6 +722,10 @@ def main():
                 max_num_seqs=local_args.max_num_seqs,
                 max_num_batched_tokens=local_args.max_num_batched_tokens,
                 chunked_prefill_size=local_args.chunked_prefill_size,
+                enable_cb_prefill_liveness=local_args.enable_cb_prefill_liveness,
+                cb_prefill_reserve_ratio=local_args.cb_prefill_reserve_ratio,
+                cb_prefill_min_tokens=local_args.cb_prefill_min_tokens,
+                cb_prefill_min_seqs=local_args.cb_prefill_min_seqs,
                 tensor_parallel_size=local_args.tensor_parallel_size,
                 enforce_eager=local_args.enforce_eager,
                 gpu_sample_interval_ms=local_args.gpu_sample_interval_ms,
@@ -826,6 +848,10 @@ def main():
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
         chunked_prefill_size=args.chunked_prefill_size,
+        enable_cb_prefill_liveness=args.enable_cb_prefill_liveness,
+        cb_prefill_reserve_ratio=args.cb_prefill_reserve_ratio,
+        cb_prefill_min_tokens=args.cb_prefill_min_tokens,
+        cb_prefill_min_seqs=args.cb_prefill_min_seqs,
         tensor_parallel_size=args.tensor_parallel_size,
         enforce_eager=args.enforce_eager,
         gpu_sample_interval_ms=args.gpu_sample_interval_ms,

@@ -27,6 +27,10 @@ class Scheduler:
         self.enable_continuous_batching = config.enable_continuous_batching
         self.enable_chunked_prefill = config.enable_chunked_prefill
         self.chunked_prefill_size = config.chunked_prefill_size
+        self.enable_cb_prefill_liveness = config.enable_cb_prefill_liveness
+        self.cb_prefill_reserve_ratio = config.cb_prefill_reserve_ratio
+        self.cb_prefill_min_tokens = config.cb_prefill_min_tokens
+        self.cb_prefill_min_seqs = config.cb_prefill_min_seqs
         self.schedule_decode_next = False
         self.eos = config.eos
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
@@ -48,22 +52,50 @@ class Scheduler:
                 return True
         return False
 
-    def schedule(self) -> ScheduleBatch:
-        if self.enable_continuous_batching:
-            return self._schedule_continuous()
-        return self._schedule_legacy()
+    def _compute_prefill_reserve(self) -> tuple[int, int]:
+        if (
+            not self.enable_cb_prefill_liveness
+            or not self.running
+            or not self.waiting
+        ):
+            return 0, 0
 
-    def _schedule_continuous(self) -> ScheduleBatch:
-        scheduled_items = []
-        scheduled_seq_ids = set()
-        scheduled_running = []
-        num_seqs = 0
-        num_batched_tokens = 0
+        reserve_tokens = max(
+            self.cb_prefill_min_tokens,
+            int(self.max_num_batched_tokens * self.cb_prefill_reserve_ratio),
+        )
+        reserve_seqs = self.cb_prefill_min_seqs
 
-        # Decode is latency-sensitive. Schedule one token for active sequences first.
+        # Keep at least minimal decode room when both queues are non-empty.
+        if self.max_num_batched_tokens <= 1:
+            reserve_tokens = 0
+        else:
+            reserve_tokens = min(reserve_tokens, self.max_num_batched_tokens - 1)
+
+        if self.max_num_seqs <= 1:
+            reserve_seqs = 0
+        else:
+            reserve_seqs = min(reserve_seqs, self.max_num_seqs - 1)
+
+        return max(reserve_tokens, 0), max(reserve_seqs, 0)
+
+    def _schedule_decode_pass(
+        self,
+        scheduled_items: list[ScheduledItem],
+        scheduled_seq_ids: set[int],
+        decode_scheduled_running: list[Sequence],
+        num_seqs: int,
+        num_batched_tokens: int,
+        seq_limit: int,
+        token_limit: int,
+    ) -> tuple[int, int]:
+        deferred_running = []
         while self.running and num_seqs < self.max_num_seqs and num_batched_tokens < self.max_num_batched_tokens:
+            if num_seqs >= seq_limit or num_batched_tokens >= token_limit:
+                break
             seq = self.running.popleft()
             if seq.seq_id in scheduled_seq_ids:
+                deferred_running.append(seq)
                 continue
             if seq.num_computed_tokens >= len(seq):
                 seq.num_computed_tokens = len(seq) - 1
@@ -80,16 +112,32 @@ class Scheduler:
             seq.status = SequenceStatus.RUNNING
             seq.scheduled_tokens = 1
             scheduled_items.append(ScheduledItem(seq, 1, True, True))
-            scheduled_running.append(seq)
+            decode_scheduled_running.append(seq)
             scheduled_seq_ids.add(seq.seq_id)
             num_seqs += 1
             num_batched_tokens += 1
+        if deferred_running:
+            self.running.extend(deferred_running)
+        return num_seqs, num_batched_tokens
 
-        # Round-robin decode fairness: scheduled sequences go to the tail.
-        self.running.extend(scheduled_running)
-
-        # Fill leftover budget with waiting/recompute chunks.
+    def _schedule_prefill_pass(
+        self,
+        scheduled_items: list[ScheduledItem],
+        scheduled_seq_ids: set[int],
+        num_seqs: int,
+        num_batched_tokens: int,
+        target_prefill_tokens: int,
+        target_prefill_seqs: int,
+    ) -> tuple[int, int, int, int]:
+        scheduled_prefill_tokens = 0
+        scheduled_prefill_seqs = 0
         while self.waiting and num_seqs < self.max_num_seqs and num_batched_tokens < self.max_num_batched_tokens:
+            if (
+                scheduled_prefill_tokens >= target_prefill_tokens
+                and scheduled_prefill_seqs >= target_prefill_seqs
+            ):
+                break
+
             seq = self.waiting[0]
             if seq.seq_id in scheduled_seq_ids:
                 break
@@ -112,6 +160,15 @@ class Scheduler:
             num_budget_tokens = self.max_num_batched_tokens - num_batched_tokens
             if num_budget_tokens <= 0:
                 break
+            remain_target_tokens = max(target_prefill_tokens - scheduled_prefill_tokens, 0)
+            remain_target_seqs = max(target_prefill_seqs - scheduled_prefill_seqs, 0)
+            if remain_target_tokens > 0:
+                num_budget_tokens = min(num_budget_tokens, remain_target_tokens)
+            elif remain_target_seqs > 0:
+                num_budget_tokens = min(num_budget_tokens, 1)
+            else:
+                break
+
             num_query_tokens = min(num_remaining_tokens, num_budget_tokens)
             if self.enable_chunked_prefill:
                 num_query_tokens = min(num_query_tokens, self.chunked_prefill_size)
@@ -133,6 +190,80 @@ class Scheduler:
             scheduled_seq_ids.add(seq.seq_id)
             num_seqs += 1
             num_batched_tokens += num_query_tokens
+            scheduled_prefill_tokens += num_query_tokens
+            scheduled_prefill_seqs += 1
+        return num_seqs, num_batched_tokens, scheduled_prefill_tokens, scheduled_prefill_seqs
+
+    def schedule(self) -> ScheduleBatch:
+        if self.enable_continuous_batching:
+            return self._schedule_continuous()
+        return self._schedule_legacy()
+
+    def _schedule_continuous(self) -> ScheduleBatch:
+        scheduled_items = []
+        scheduled_seq_ids = set()
+        decode_scheduled_running = []
+        num_seqs = 0
+        num_batched_tokens = 0
+
+        reserve_prefill_tokens, reserve_prefill_seqs = self._compute_prefill_reserve()
+
+        # Pass 1: decode first, while reserving minimal quota for prefill liveness.
+        decode_seq_limit = max(self.max_num_seqs - reserve_prefill_seqs, 0)
+        decode_token_limit = max(self.max_num_batched_tokens - reserve_prefill_tokens, 0)
+        num_seqs, num_batched_tokens = self._schedule_decode_pass(
+            scheduled_items,
+            scheduled_seq_ids,
+            decode_scheduled_running,
+            num_seqs,
+            num_batched_tokens,
+            decode_seq_limit,
+            decode_token_limit,
+        )
+
+        # Pass 2: guarantee minimal prefill progress.
+        if self.waiting and num_seqs < self.max_num_seqs and num_batched_tokens < self.max_num_batched_tokens:
+            if reserve_prefill_tokens > 0 or reserve_prefill_seqs > 0:
+                target_prefill_tokens = reserve_prefill_tokens
+                target_prefill_seqs = reserve_prefill_seqs
+            else:
+                # No decode pressure: let prefill use all available budget.
+                target_prefill_tokens = self.max_num_batched_tokens
+                target_prefill_seqs = self.max_num_seqs
+            num_seqs, num_batched_tokens, _, _ = self._schedule_prefill_pass(
+                scheduled_items,
+                scheduled_seq_ids,
+                num_seqs,
+                num_batched_tokens,
+                target_prefill_tokens,
+                target_prefill_seqs,
+            )
+
+        # Pass 3: return unused quota to decode.
+        if self.running and num_seqs < self.max_num_seqs and num_batched_tokens < self.max_num_batched_tokens:
+            num_seqs, num_batched_tokens = self._schedule_decode_pass(
+                scheduled_items,
+                scheduled_seq_ids,
+                decode_scheduled_running,
+                num_seqs,
+                num_batched_tokens,
+                self.max_num_seqs,
+                self.max_num_batched_tokens,
+            )
+
+        # If decode drained out, avoid under-utilization by letting prefill backfill.
+        if (not self.running) and self.waiting and num_seqs < self.max_num_seqs and num_batched_tokens < self.max_num_batched_tokens:
+            num_seqs, num_batched_tokens, _, _ = self._schedule_prefill_pass(
+                scheduled_items,
+                scheduled_seq_ids,
+                num_seqs,
+                num_batched_tokens,
+                self.max_num_batched_tokens,
+                self.max_num_seqs,
+            )
+
+        # Round-robin decode fairness: scheduled decode sequences go to tail once.
+        self.running.extend(decode_scheduled_running)
 
         if not scheduled_items:
             raise RuntimeError("scheduler has no runnable sequences")
