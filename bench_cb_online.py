@@ -249,11 +249,13 @@ def run_once(
             )
         return sp_cache[out_len]
 
-    t0 = time.perf_counter()
-    t_end = t0
+    t0 = 0.0
+    t_end = 0.0
     first_arrival: Optional[float] = None
     try:
         warmup(llm)
+        t0 = time.perf_counter()
+        t_end = t0
         sampler.start()
         next_idx = 0
         done = 0
@@ -388,12 +390,82 @@ def parse_int_csv(raw: str) -> list[int]:
     return xs
 
 
+def parse_float_csv(raw: str) -> list[float]:
+    xs = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        xs.append(float(part))
+    return xs
+
+
 def is_nan_or_none(v: Optional[float]) -> bool:
     if v is None:
         return True
     if isinstance(v, float) and (v != v):
         return True
     return False
+
+
+def aggregate_trial_results(mode_name: str, runs: list[dict]) -> dict:
+    if len(runs) == 1:
+        out = dict(runs[0])
+        out["mode"] = mode_name
+        out["num_trials"] = 1
+        return out
+
+    metric_keys = [
+        "throughput_rps",
+        "avg_ttft_ms",
+        "avg_itl_ms_per_token",
+        "avg_latency_ms",
+        "p50_latency_ms",
+        "p95_latency_ms",
+        "p99_latency_ms",
+        "gpu_util_avg_percent",
+        "makespan_s",
+    ]
+
+    out = dict(runs[0])
+    out["mode"] = mode_name
+    out["num_trials"] = len(runs)
+
+    for key in metric_keys:
+        vals = [r[key] for r in runs if key in r and not is_nan_or_none(r[key])]
+        out[key] = statistics.median(vals) if vals else float("nan")
+
+    tiers = {}
+    tier_names = set()
+    for r in runs:
+        tier_names.update(r.get("tiers", {}).keys())
+    tier_metric_keys = ["avg_ttft_ms", "avg_itl_ms_per_token", "avg_latency_ms", "p95_latency_ms", "p99_latency_ms"]
+    for tier in sorted(tier_names):
+        tiers[tier] = {}
+        for mkey in tier_metric_keys:
+            vals = []
+            for r in runs:
+                v = r.get("tiers", {}).get(tier, {}).get(mkey, float("nan"))
+                if not is_nan_or_none(v):
+                    vals.append(v)
+            tiers[tier][mkey] = statistics.median(vals) if vals else float("nan")
+    out["tiers"] = tiers
+    return out
+
+
+def run_trials(mode_name: str, num_trials: int, run_kwargs: dict) -> dict:
+    trial_runs = []
+    for i in range(num_trials):
+        trial_mode = f"{mode_name}_t{i+1}"
+        kwargs = dict(run_kwargs)
+        kwargs["mode_name"] = trial_mode
+        r = run_once_guarded(**kwargs)
+        if "error" in r:
+            return r
+        trial_runs.append(r)
+        if i != num_trials - 1:
+            cleanup_between_runs()
+    return aggregate_trial_results(mode_name, trial_runs)
 
 
 def dominates(base: dict, cand: dict) -> bool:
@@ -548,13 +620,16 @@ def print_opt_report(base: dict, candidates: list[dict], best: dict, found_domin
     print("Goal: throughput up, and TTFT/ITL/latency/P95/makespan all down")
     print("")
     print(
-        f"{'Candidate':<20} {'Chunk':>8} {'BatchedTok':>10} "
+        f"{'Candidate':<20} {'Chunk':>8} {'BatchedTok':>10} {'RsvR':>6} {'RsvTok':>8} {'RsvSeq':>8} "
         f"{'Thrpt':>10} {'TTFT':>10} {'ITL':>10} {'P95':>10} {'Mkspan':>10} {'Dominates':>10}"
     )
-    print("-" * 114)
+    print("-" * 144)
     for r in candidates:
         print(
             f"{r['mode']:<20} {r['chunked_prefill_size']:>8} {r['max_num_batched_tokens']:>10} "
+            f"{r.get('cb_prefill_reserve_ratio', float('nan')):>6.2f} "
+            f"{r.get('cb_prefill_min_tokens', -1):>8} "
+            f"{r.get('cb_prefill_min_seqs', -1):>8} "
             f"{fmt(r['throughput_rps']):>10} {fmt(r['avg_ttft_ms']):>10} {fmt(r['avg_itl_ms_per_token']):>10} "
             f"{fmt(r['p95_latency_ms']):>10} {fmt(r['makespan_s']):>10} "
             f"{'YES' if r['dominates'] else 'NO':>10}"
@@ -563,7 +638,11 @@ def print_opt_report(base: dict, candidates: list[dict], best: dict, found_domin
     print("\n=== Best Candidate ===")
     print(
         f"{best['mode']}, chunked_prefill_size={best['chunked_prefill_size']}, "
-        f"max_num_batched_tokens={best['max_num_batched_tokens']}, dominates={best['dominates']}"
+        f"max_num_batched_tokens={best['max_num_batched_tokens']}, "
+        f"reserve_ratio={best.get('cb_prefill_reserve_ratio')}, "
+        f"reserve_min_tokens={best.get('cb_prefill_min_tokens')}, "
+        f"reserve_min_seqs={best.get('cb_prefill_min_seqs')}, "
+        f"dominates={best['dominates']}"
     )
     print(
         "Gain vs OFF/OFF: "
@@ -602,6 +681,9 @@ def print_opt_search_report(scenarios: list[dict], global_best: dict, found_domi
         f"interval={global_best['arrival_interval_ms']}ms, mode={global_best['mode']}, "
         f"chunked_prefill_size={global_best['chunked_prefill_size']}, "
         f"max_num_batched_tokens={global_best['max_num_batched_tokens']}, "
+        f"reserve_ratio={global_best.get('cb_prefill_reserve_ratio')}, "
+        f"reserve_min_tokens={global_best.get('cb_prefill_min_tokens')}, "
+        f"reserve_min_seqs={global_best.get('cb_prefill_min_seqs')}, "
         f"dominates={global_best['dominates']}"
     )
     if found_dominating:
@@ -651,7 +733,11 @@ def parse_args():
     parser.add_argument("--opt-arrival-interval-ms", type=str, default="")
     parser.add_argument("--opt-chunked-prefill-sizes", type=str, default="256,512,768,1024,1536,2048")
     parser.add_argument("--opt-max-num-batched-tokens", type=str, default="")
+    parser.add_argument("--opt-cb-prefill-reserve-ratios", type=str, default="")
+    parser.add_argument("--opt-cb-prefill-min-tokens", type=str, default="")
+    parser.add_argument("--opt-cb-prefill-min-seqs", type=str, default="")
     parser.add_argument("--opt-stop-on-first-dominating", action="store_true")
+    parser.add_argument("--trials-per-config", type=int, default=1)
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--max-num-seqs", type=int, default=512)
     parser.add_argument("--max-num-batched-tokens", type=int, default=16384)
@@ -677,6 +763,7 @@ def main():
     assert args.arrival_interval_ms >= 0, "arrival-interval-ms must be >= 0"
     assert args.max_num_seqs > 0, "max-num-seqs must be > 0"
     assert args.max_num_batched_tokens > 0, "max-num-batched-tokens must be > 0"
+    assert args.trials_per_config > 0, "trials-per-config must be > 0"
     assert 0.0 <= args.cb_prefill_reserve_ratio <= 1.0, "cb-prefill-reserve-ratio must be in [0, 1]"
     assert args.cb_prefill_min_tokens >= 0, "cb-prefill-min-tokens must be >= 0"
     assert args.cb_prefill_min_seqs >= 0, "cb-prefill-min-seqs must be >= 0"
@@ -697,10 +784,22 @@ def main():
         max_batched_tokens_list = parse_int_csv(args.opt_max_num_batched_tokens)
         if not max_batched_tokens_list:
             max_batched_tokens_list = [args.max_num_batched_tokens]
+        reserve_ratios = parse_float_csv(args.opt_cb_prefill_reserve_ratios)
+        if not reserve_ratios:
+            reserve_ratios = [args.cb_prefill_reserve_ratio]
+        reserve_min_tokens_list = parse_int_csv(args.opt_cb_prefill_min_tokens)
+        if not reserve_min_tokens_list:
+            reserve_min_tokens_list = [args.cb_prefill_min_tokens]
+        reserve_min_seqs_list = parse_int_csv(args.opt_cb_prefill_min_seqs)
+        if not reserve_min_seqs_list:
+            reserve_min_seqs_list = [args.cb_prefill_min_seqs]
 
         assert all(x >= 0 for x in interval_list), "opt-arrival-interval-ms values must be >= 0"
         assert all(x > 0 for x in chunk_sizes), "opt-chunked-prefill-sizes values must be > 0"
         assert all(x > 0 for x in max_batched_tokens_list), "opt-max-num-batched-tokens values must be > 0"
+        assert all(0.0 <= x <= 1.0 for x in reserve_ratios), "opt-cb-prefill-reserve-ratios must be in [0, 1]"
+        assert all(x >= 0 for x in reserve_min_tokens_list), "opt-cb-prefill-min-tokens values must be >= 0"
+        assert all(x >= 0 for x in reserve_min_seqs_list), "opt-cb-prefill-min-seqs values must be >= 0"
 
         scenarios = []
         all_candidates = []
@@ -733,11 +832,14 @@ def main():
             )
 
             print(f"Running baseline off_off (CB=OFF, CP=OFF), arrival={interval_ms}ms ...")
-            baseline = run_once_guarded(
+            baseline = run_trials(
                 mode_name=f"off_off_i{interval_ms}",
-                enable_cb=False,
-                enable_chunked_prefill=False,
-                **common_kwargs,
+                num_trials=args.trials_per_config,
+                run_kwargs=dict(
+                    common_kwargs,
+                    enable_cb=False,
+                    enable_chunked_prefill=False,
+                ),
             )
             if "error" in baseline:
                 raise RuntimeError(
@@ -749,28 +851,43 @@ def main():
             candidates = []
             for mbt in max_batched_tokens_list:
                 for csz in chunk_sizes:
-                    name = f"on_on_i{interval_ms}_c{csz}_b{mbt}"
-                    print(f"Running candidate {name} (CB=ON, CP=ON) ...")
-                    cand_kwargs = dict(common_kwargs)
-                    cand_kwargs["max_num_batched_tokens"] = mbt
-                    cand_kwargs["chunked_prefill_size"] = csz
-                    r = run_once_guarded(
-                        mode_name=name,
-                        enable_cb=True,
-                        enable_chunked_prefill=True,
-                        **cand_kwargs,
-                    )
-                    if "error" in r:
-                        cleanup_between_runs()
-                        continue
-                    r["chunked_prefill_size"] = csz
-                    r["max_num_batched_tokens"] = mbt
-                    r["arrival_interval_ms"] = interval_ms
-                    r["dominates"] = dominates(baseline, r)
-                    r["score"] = dominance_score(baseline, r)
-                    candidates.append(r)
-                    all_candidates.append(r)
-                    cleanup_between_runs()
+                    for rsv_ratio in reserve_ratios:
+                        for rsv_min_tok in reserve_min_tokens_list:
+                            for rsv_min_seq in reserve_min_seqs_list:
+                                name = (
+                                    f"on_on_i{interval_ms}_c{csz}_b{mbt}_"
+                                    f"r{rsv_ratio:.2f}_t{rsv_min_tok}_s{rsv_min_seq}"
+                                )
+                                print(f"Running candidate {name} (CB=ON, CP=ON) ...")
+                                cand_kwargs = dict(common_kwargs)
+                                cand_kwargs["max_num_batched_tokens"] = mbt
+                                cand_kwargs["chunked_prefill_size"] = csz
+                                cand_kwargs["cb_prefill_reserve_ratio"] = rsv_ratio
+                                cand_kwargs["cb_prefill_min_tokens"] = rsv_min_tok
+                                cand_kwargs["cb_prefill_min_seqs"] = rsv_min_seq
+                                r = run_trials(
+                                    mode_name=name,
+                                    num_trials=args.trials_per_config,
+                                    run_kwargs=dict(
+                                        cand_kwargs,
+                                        enable_cb=True,
+                                        enable_chunked_prefill=True,
+                                    ),
+                                )
+                                if "error" in r:
+                                    cleanup_between_runs()
+                                    continue
+                                r["chunked_prefill_size"] = csz
+                                r["max_num_batched_tokens"] = mbt
+                                r["cb_prefill_reserve_ratio"] = rsv_ratio
+                                r["cb_prefill_min_tokens"] = rsv_min_tok
+                                r["cb_prefill_min_seqs"] = rsv_min_seq
+                                r["arrival_interval_ms"] = interval_ms
+                                r["dominates"] = dominates(baseline, r)
+                                r["score"] = dominance_score(baseline, r)
+                                candidates.append(r)
+                                all_candidates.append(r)
+                                cleanup_between_runs()
 
             if not candidates:
                 print(f"[WARN] No valid ON/ON candidate at arrival={interval_ms}ms (all failed/OOM).")
@@ -817,6 +934,10 @@ def main():
             f"--arrival-interval-ms {global_best['arrival_interval_ms']} "
             f"--chunked-prefill-size {global_best['chunked_prefill_size']} "
             f"--max-num-batched-tokens {global_best['max_num_batched_tokens']} "
+            f"--cb-prefill-reserve-ratio {global_best.get('cb_prefill_reserve_ratio', args.cb_prefill_reserve_ratio)} "
+            f"--cb-prefill-min-tokens {global_best.get('cb_prefill_min_tokens', args.cb_prefill_min_tokens)} "
+            f"--cb-prefill-min-seqs {global_best.get('cb_prefill_min_seqs', args.cb_prefill_min_seqs)} "
+            f"--trials-per-config {args.trials_per_config} "
             f"--num-requests {args.num_requests} "
             f"--workload-profile {args.workload_profile} "
             f"--arrival-pattern {args.arrival_pattern}"
@@ -874,12 +995,17 @@ def main():
     results = {}
     for i, (name, cb, cp) in enumerate(mode_plan):
         print(f"Running {name} (CB={'ON' if cb else 'OFF'}, CP={'ON' if cp else 'OFF'}) ...")
-        results[name] = run_once(
+        results[name] = run_trials(
             mode_name=name,
-            enable_cb=cb,
-            enable_chunked_prefill=cp,
-            **common_kwargs,
+            num_trials=args.trials_per_config,
+            run_kwargs=dict(
+                common_kwargs,
+                enable_cb=cb,
+                enable_chunked_prefill=cp,
+            ),
         )
+        if "error" in results[name]:
+            raise RuntimeError(f"{name} failed: {results[name]['error']}")
         if i != len(mode_plan) - 1:
             cleanup_between_runs()
 

@@ -64,6 +64,8 @@ class Scheduler:
             self.cb_prefill_min_tokens,
             int(self.max_num_batched_tokens * self.cb_prefill_reserve_ratio),
         )
+        if self.enable_chunked_prefill and self.chunked_prefill_size > 0 and reserve_tokens > 0:
+            reserve_tokens = ((reserve_tokens + self.chunked_prefill_size - 1) // self.chunked_prefill_size) * self.chunked_prefill_size
         reserve_seqs = self.cb_prefill_min_seqs
 
         # Keep at least minimal decode room when both queues are non-empty.
@@ -71,6 +73,13 @@ class Scheduler:
             reserve_tokens = 0
         else:
             reserve_tokens = min(reserve_tokens, self.max_num_batched_tokens - 1)
+            if (
+                self.enable_chunked_prefill
+                and self.chunked_prefill_size > 0
+                and reserve_tokens > self.chunked_prefill_size
+                and reserve_tokens % self.chunked_prefill_size != 0
+            ):
+                reserve_tokens -= reserve_tokens % self.chunked_prefill_size
 
         if self.max_num_seqs <= 1:
             reserve_seqs = 0
@@ -161,12 +170,9 @@ class Scheduler:
             if num_budget_tokens <= 0:
                 break
             remain_target_tokens = max(target_prefill_tokens - scheduled_prefill_tokens, 0)
-            remain_target_seqs = max(target_prefill_seqs - scheduled_prefill_seqs, 0)
             if remain_target_tokens > 0:
                 num_budget_tokens = min(num_budget_tokens, remain_target_tokens)
-            elif remain_target_seqs > 0:
-                num_budget_tokens = min(num_budget_tokens, 1)
-            else:
+            if num_budget_tokens <= 0:
                 break
 
             num_query_tokens = min(num_remaining_tokens, num_budget_tokens)
