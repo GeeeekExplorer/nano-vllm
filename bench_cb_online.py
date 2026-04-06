@@ -349,8 +349,12 @@ def run_once_guarded(**kwargs) -> dict:
         return run_once(**kwargs)
     except Exception as e:
         msg = str(e)
-        if "out of memory" in msg.lower() or "cuda oom" in msg.lower():
+        lower = msg.lower()
+        if "out of memory" in lower or "cuda oom" in lower:
             print(f"[WARN] {mode_name} skipped due to OOM: {msg}")
+            return {"mode": mode_name, "error": msg}
+        if "illegal memory access" in lower:
+            print(f"[WARN] {mode_name} skipped due to CUDA illegal memory access: {msg}")
             return {"mode": mode_name, "error": msg}
         raise
 

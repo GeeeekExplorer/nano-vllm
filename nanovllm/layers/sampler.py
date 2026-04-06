@@ -7,7 +7,6 @@ class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
 
-    @torch.compile
     def forward(self, logits: torch.Tensor, temperatures: torch.Tensor, top_ps: torch.Tensor):
         logits = logits.float()
         greedy_tokens = logits.argmax(dim=-1)
