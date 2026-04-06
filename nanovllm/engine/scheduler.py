@@ -98,6 +98,17 @@ class Scheduler:
         seq_limit: int,
         token_limit: int,
     ) -> tuple[int, int]:
+        def pop_preempt_victim() -> Sequence | None:
+            # Never preempt sequences already scheduled in this step.
+            # They may already be part of current ScheduleBatch.
+            for i in range(len(self.running) - 1, -1, -1):
+                victim = self.running[i]
+                if victim.seq_id in scheduled_seq_ids:
+                    continue
+                del self.running[i]
+                return victim
+            return None
+
         deferred_running = []
         while self.running and num_seqs < self.max_num_seqs and num_batched_tokens < self.max_num_batched_tokens:
             if num_seqs >= seq_limit or num_batched_tokens >= token_limit:
@@ -109,12 +120,12 @@ class Scheduler:
             if seq.num_computed_tokens >= len(seq):
                 seq.num_computed_tokens = len(seq) - 1
             while not self.block_manager.can_append(seq):
-                if self.running:
-                    self.preempt(self.running.pop())
-                else:
+                victim = pop_preempt_victim()
+                if victim is None:
                     self.preempt(seq)
                     seq = None
                     break
+                self.preempt(victim)
             if seq is None:
                 break
             self.block_manager.may_append(seq)
