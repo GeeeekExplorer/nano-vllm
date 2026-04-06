@@ -6,7 +6,9 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.registry import ModelRegistry
+from nanovllm.models.qwen3 import Qwen3ForCausalLM  # Import to register
+from nanovllm.kvcache import KVCacheRegistry
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -28,8 +30,14 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        
+        # Create model from registry
+        self.model = ModelRegistry.create_model(hf_config, config.model_architecture)
         load_model(self.model, config.model)
+        
+        # Create KV cache backend
+        self.cache_backend_class = KVCacheRegistry.get_cache_class(config.kvcache_type)
+        
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
@@ -106,15 +114,44 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        
+        # Create a temporary cache backend to calculate block size
+        temp_cache = self.cache_backend_class(
+            num_blocks=1,
+            block_size=self.block_size,
+            num_heads=num_kv_heads,
+            head_dim=head_dim,
+            dtype=hf_config.torch_dtype,
+        )
+        block_bytes = temp_cache.get_cache_block_size_bytes()
+        
+        # Calculate number of blocks per layer
+        config.num_kvcache_blocks = int(
+            total * config.gpu_memory_utilization - used - peak + current
+        ) // block_bytes
+        assert config.num_kvcache_blocks > 0, \
+            f"Not enough GPU memory for KV cache. Available: {total * config.gpu_memory_utilization - used - peak + current} bytes, needed per block: {block_bytes} bytes"
+        
+        # Create cache backends for each layer and allocate tensors
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
+                # Create cache backend for this layer
+                cache_backend = self.cache_backend_class(
+                    num_blocks=config.num_kvcache_blocks,
+                    block_size=self.block_size,
+                    num_heads=num_kv_heads,
+                    head_dim=head_dim,
+                    dtype=hf_config.torch_dtype,
+                )
+                
+                # Let cache backend allocate its tensors
+                k_cache, v_cache = cache_backend.allocate()
+                
+                # Assign to module
+                module.k_cache = k_cache
+                module.v_cache = v_cache
+                module.cache_backend = cache_backend
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):

@@ -16,6 +16,10 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    # Model architecture (None = auto-detect from hf_config)
+    model_architecture: str | None = None
+    # KV cache type ("default" = no quantization, "int8", "int4", etc.)
+    kvcache_type: str = "default"
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

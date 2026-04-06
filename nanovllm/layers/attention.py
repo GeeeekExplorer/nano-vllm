@@ -1,75 +1,94 @@
 import torch
 from torch import nn
-import triton
-import triton.language as tl
 
-from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
-
-
-@triton.jit
-def store_kvcache_kernel(
-    key_ptr,
-    key_stride,
-    value_ptr,
-    value_stride,
-    k_cache_ptr,
-    v_cache_ptr,
-    slot_mapping_ptr,
-    D: tl.constexpr,
-):
-    idx = tl.program_id(0)
-    slot = tl.load(slot_mapping_ptr + idx)
-    if slot == -1: return
-    key_offsets = idx * key_stride + tl.arange(0, D)
-    value_offsets = idx * value_stride + tl.arange(0, D)
-    key = tl.load(key_ptr + key_offsets)
-    value = tl.load(value_ptr + value_offsets)
-    cache_offsets = slot * D + tl.arange(0, D)
-    tl.store(k_cache_ptr + cache_offsets, key)
-    tl.store(v_cache_ptr + cache_offsets, value)
-
-
-def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor):
-    N, num_heads, head_dim = key.shape
-    D = num_heads * head_dim
-    assert key.stride(-1) == 1 and value.stride(-1) == 1
-    assert key.stride(1) == head_dim and value.stride(1) == head_dim
-    assert k_cache.stride(1) == D and v_cache.stride(1) == D
-    assert slot_mapping.numel() == N
-    store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
+from nanovllm.kvcache.base import BaseKVCache
+from nanovllm.layers.flash_attn_backend import BaseFlashAttentionBackend, FlashAttentionRegistry
 
 
 class Attention(nn.Module):
+    """
+    Attention module with pluggable KV cache and flash attention backends.
+    
+    This module supports:
+    - Different KV cache implementations (FP16, INT8, INT4, etc.)
+    - Different flash attention backends (standard, quantized-aware, custom)
+    
+    The separation allows you to:
+    - Use INT8 cache with dequantization + standard flash-attn
+    - OR use INT8 cache with custom INT8-aware flash-attn kernel
+    """
 
     def __init__(
         self,
-        num_heads,
-        head_dim,
-        scale,
-        num_kv_heads,
+        num_heads: int,
+        head_dim: int,
+        scale: float,
+        num_kv_heads: int,
+        cache_backend: BaseKVCache | None = None,
+        attn_backend: BaseFlashAttentionBackend | None = None,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.scale = scale
         self.num_kv_heads = num_kv_heads
+        self.cache_backend = cache_backend
+        
+        # Flash attention backend - defaults to "default" implementation
+        if attn_backend is None:
+            # Import here to ensure registry is populated
+            from nanovllm.layers.default_flash_attn import DefaultFlashAttention
+            attn_backend = DefaultFlashAttention()
+        self.attn_backend = attn_backend
+        
+        # Cache tensors (will be set by model runner)
         self.k_cache = self.v_cache = torch.tensor([])
+        self.additional_cache_tensors = ()  # For quantized caches (scales, etc.)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
+        
+        # Store KV pairs in cache using the cache backend
         if k_cache.numel() and v_cache.numel():
-            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+            if self.cache_backend is not None:
+                # Store supports additional tensors for quantized caches
+                self.cache_backend.store(
+                    k, v, k_cache, v_cache, context.slot_mapping,
+                    *self.additional_cache_tensors
+                )
+            else:
+                raise RuntimeError(
+                    "No KV cache backend configured. This should not happen - "
+                    "ensure DefaultKVCache is imported and registered."
+                )
+        
+        # Perform attention using pluggable backend
         if context.is_prefill:
-            if context.block_tables is not None:    # prefix cache
+            # For prefill, use keys/values or cache depending on prefix caching
+            if context.block_tables is not None:  # prefix cache
                 k, v = k_cache, v_cache
-            o = flash_attn_varlen_func(q, k, v,
-                                       max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
-                                       max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                                       softmax_scale=self.scale, causal=True, block_table=context.block_tables)
-        else:    # decode
-            o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, block_table=context.block_tables, 
-                                        softmax_scale=self.scale, causal=True)
+            
+            o = self.attn_backend.prefill(
+                q, k, v,
+                scale=self.scale,
+                max_seqlen_q=context.max_seqlen_q,
+                cu_seqlens_q=context.cu_seqlens_q,
+                max_seqlen_k=context.max_seqlen_k,
+                cu_seqlens_k=context.cu_seqlens_k,
+                block_table=context.block_tables,
+            )
+        else:  # decode
+            # Pass all cache tensors to backend (quantized backends need scales, etc.)
+            o = self.attn_backend.decode(
+                q,
+                k_cache,
+                v_cache,
+                scale=self.scale,
+                cache_seqlens=context.context_lens,
+                block_table=context.block_tables,
+                *self.additional_cache_tensors,
+            )
+        
         return o

@@ -9,6 +9,8 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from nanovllm.models.base import BaseModel
+from nanovllm.models.registry import ModelRegistry
 
 
 class Qwen3Attention(nn.Module):
@@ -182,7 +184,8 @@ class Qwen3Model(nn.Module):
         return hidden_states
 
 
-class Qwen3ForCausalLM(nn.Module):
+@ModelRegistry.register("qwen3", architectures=["Qwen3ForCausalLM", "Qwen2ForCausalLM"])
+class Qwen3ForCausalLM(BaseModel):
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
@@ -195,7 +198,7 @@ class Qwen3ForCausalLM(nn.Module):
         self,
         config: Qwen3Config
     ) -> None:
-        super().__init__()
+        super().__init__(config)
         self.model = Qwen3Model(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
