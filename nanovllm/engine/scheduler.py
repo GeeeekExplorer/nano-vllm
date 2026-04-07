@@ -12,6 +12,8 @@ class ScheduledItem:
     num_query_tokens: int
     should_sample: bool
     is_decode: bool
+    prefix_cache_hit_tokens: int = 0
+    recomputed_prefill_tokens: int = 0
 
 
 @dataclass
@@ -31,7 +33,13 @@ class Scheduler:
         self.cb_prefill_reserve_ratio = config.cb_prefill_reserve_ratio
         self.cb_prefill_min_tokens = config.cb_prefill_min_tokens
         self.cb_prefill_min_seqs = config.cb_prefill_min_seqs
+        self.enable_resumable_priority = config.enable_resumable_priority
+        self.resumable_priority_cached_tokens_weight = config.resumable_priority_cached_tokens_weight
+        self.resumable_priority_remaining_prefill_tokens_weight = config.resumable_priority_remaining_prefill_tokens_weight
+        self.resumable_priority_waiting_time_weight = config.resumable_priority_waiting_time_weight
+        self.resumable_priority_preempt_count_weight = config.resumable_priority_preempt_count_weight
         self.schedule_decode_next = False
+        self.schedule_tick = 0
         self.eos = config.eos
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
@@ -41,7 +49,58 @@ class Scheduler:
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence):
+        self._append_waiting(seq)
+
+    def _append_waiting(self, seq: Sequence):
+        seq.waiting_since = self.schedule_tick
         self.waiting.append(seq)
+
+    def _appendleft_waiting(self, seq: Sequence):
+        seq.waiting_since = self.schedule_tick
+        self.waiting.appendleft(seq)
+
+    def _estimate_cached_tokens(self, seq: Sequence) -> int:
+        if seq.block_table:
+            return seq.num_computed_tokens
+        return self.block_manager.count_cached_tokens(seq)
+
+    def _compute_resumable_priority_score(self, seq: Sequence) -> tuple[float, int, int, int]:
+        cached_tokens = self._estimate_cached_tokens(seq)
+        remaining_prefill_tokens = max(len(seq) - cached_tokens, 0)
+        waiting_time = max(self.schedule_tick - seq.waiting_since, 0)
+        score = (
+            self.resumable_priority_cached_tokens_weight * cached_tokens
+            - self.resumable_priority_remaining_prefill_tokens_weight * remaining_prefill_tokens
+            + self.resumable_priority_waiting_time_weight * waiting_time
+            + self.resumable_priority_preempt_count_weight * seq.preempt_count
+        )
+        return score, cached_tokens, remaining_prefill_tokens, waiting_time
+
+    def _promote_priority_waiting(self, scheduled_seq_ids: set[int] | None = None) -> bool:
+        best_idx = None
+        best_key = None
+        for idx, seq in enumerate(self.waiting):
+            if scheduled_seq_ids is not None and seq.seq_id in scheduled_seq_ids:
+                continue
+            if not seq.block_table and not self.block_manager.can_allocate(seq):
+                continue
+            score, cached_tokens, remaining_prefill_tokens, waiting_time = self._compute_resumable_priority_score(seq)
+            key = (
+                score,
+                waiting_time,
+                cached_tokens,
+                -remaining_prefill_tokens,
+                seq.preempt_count,
+                -idx,
+            )
+            if best_key is None or key > best_key:
+                best_idx = idx
+                best_key = key
+        if best_idx is None:
+            return False
+        if best_idx != 0:
+            self.waiting.rotate(-best_idx)
+        return True
 
     def _promote_resumable_waiting(self, scheduled_seq_ids: set[int] | None = None) -> bool:
         for idx, seq in enumerate(self.waiting):
@@ -158,16 +217,22 @@ class Scheduler:
             ):
                 break
 
+            if self.enable_resumable_priority:
+                if not self._promote_priority_waiting(scheduled_seq_ids):
+                    break
             seq = self.waiting[0]
             if seq.seq_id in scheduled_seq_ids:
                 break
             allocated = False
+            prefix_cache_hit_tokens = 0
             if not seq.block_table:
                 if not self.block_manager.can_allocate(seq):
+                    if self.enable_resumable_priority:
+                        break
                     if self._promote_resumable_waiting(scheduled_seq_ids):
                         continue
                     break
-                self.block_manager.allocate(seq)
+                prefix_cache_hit_tokens = self.block_manager.allocate(seq)
                 allocated = True
 
             num_remaining_tokens = len(seq) - seq.num_computed_tokens
@@ -196,14 +261,24 @@ class Scheduler:
                 break
 
             self.waiting.popleft()
+            recomputed_prefill_tokens = seq.count_recomputed_prefill_tokens(num_query_tokens)
             seq.scheduled_tokens = num_query_tokens
             should_sample = seq.num_computed_tokens + num_query_tokens >= len(seq)
             seq.status = SequenceStatus.RUNNING if should_sample else SequenceStatus.WAITING
             if should_sample:
                 self.running.append(seq)
             else:
-                self.waiting.append(seq)
-            scheduled_items.append(ScheduledItem(seq, num_query_tokens, should_sample, False))
+                self._append_waiting(seq)
+            scheduled_items.append(
+                ScheduledItem(
+                    seq,
+                    num_query_tokens,
+                    should_sample,
+                    False,
+                    prefix_cache_hit_tokens=prefix_cache_hit_tokens,
+                    recomputed_prefill_tokens=recomputed_prefill_tokens,
+                )
+            )
             scheduled_seq_ids.add(seq.seq_id)
             num_seqs += 1
             num_batched_tokens += num_query_tokens
@@ -212,6 +287,7 @@ class Scheduler:
         return num_seqs, num_batched_tokens, scheduled_prefill_tokens, scheduled_prefill_seqs
 
     def schedule(self) -> ScheduleBatch:
+        self.schedule_tick += 1
         if self.enable_continuous_batching:
             return self._schedule_continuous()
         return self._schedule_legacy()
@@ -292,16 +368,22 @@ class Scheduler:
         num_seqs = 0
         num_batched_tokens = 0
         while self.waiting and num_seqs < self.max_num_seqs:
+            if self.enable_resumable_priority:
+                if not self._promote_priority_waiting(scheduled_seq_ids):
+                    break
             seq = self.waiting[0]
             if seq.seq_id in scheduled_seq_ids:
                 break
             allocated = False
+            prefix_cache_hit_tokens = 0
             if not seq.block_table:
                 if not self.block_manager.can_allocate(seq):
+                    if self.enable_resumable_priority:
+                        break
                     if self._promote_resumable_waiting(scheduled_seq_ids):
                         continue
                     break
-                self.block_manager.allocate(seq)
+                prefix_cache_hit_tokens = self.block_manager.allocate(seq)
                 allocated = True
 
             num_remaining_prompt_tokens = seq.num_prompt_tokens - seq.num_computed_tokens
@@ -331,14 +413,24 @@ class Scheduler:
             num_batched_tokens += num_query_tokens
             self.waiting.popleft()
             scheduled_seq_ids.add(seq.seq_id)
+            recomputed_prefill_tokens = seq.count_recomputed_prefill_tokens(num_query_tokens)
             should_sample = seq.num_computed_tokens + num_query_tokens >= seq.num_prompt_tokens
             seq.scheduled_tokens = num_query_tokens
             seq.status = SequenceStatus.RUNNING if should_sample else SequenceStatus.WAITING
-            scheduled_items.append(ScheduledItem(seq, num_query_tokens, should_sample, False))
+            scheduled_items.append(
+                ScheduledItem(
+                    seq,
+                    num_query_tokens,
+                    should_sample,
+                    False,
+                    prefix_cache_hit_tokens=prefix_cache_hit_tokens,
+                    recomputed_prefill_tokens=recomputed_prefill_tokens,
+                )
+            )
             if should_sample:
                 self.running.append(seq)
             else:
-                self.waiting.append(seq)
+                self._append_waiting(seq)
         return scheduled_items
 
     def _schedule_decode_legacy(self) -> list[ScheduledItem]:
@@ -390,15 +482,21 @@ class Scheduler:
         raise RuntimeError("scheduler has no runnable sequences")
 
     def preempt(self, seq: Sequence):
+        if seq in self.running:
+            self.running.remove(seq)
+        if seq in self.waiting:
+            self.waiting.remove(seq)
         seq.status = SequenceStatus.WAITING
         seq.scheduled_tokens = 0
+        seq.preempt_count += 1
         self.block_manager.deallocate(seq)
-        self.waiting.appendleft(seq)
+        self._appendleft_waiting(seq)
 
     def postprocess(self, batch: ScheduleBatch, token_ids: list[int]):
         for item, token_id in zip(batch.items, token_ids):
             seq = item.seq
             seq.num_computed_tokens += item.num_query_tokens
+            seq.max_context_tokens_seen = max(seq.max_context_tokens_seen, seq.num_computed_tokens)
             seq.scheduled_tokens = 0
             if not item.should_sample:
                 seq.status = SequenceStatus.WAITING

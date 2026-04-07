@@ -16,6 +16,11 @@ class Config:
     cb_prefill_reserve_ratio: float = 0.2
     cb_prefill_min_tokens: int = 512
     cb_prefill_min_seqs: int = 1
+    enable_resumable_priority: bool = False
+    resumable_priority_cached_tokens_weight: float = 1.0
+    resumable_priority_remaining_prefill_tokens_weight: float = 1.0
+    resumable_priority_waiting_time_weight: float = 1.0
+    resumable_priority_preempt_count_weight: float = 1.0
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
@@ -31,6 +36,10 @@ class Config:
         assert 0.0 <= self.cb_prefill_reserve_ratio <= 1.0
         assert self.cb_prefill_min_tokens >= 0
         assert self.cb_prefill_min_seqs >= 0
+        assert self.resumable_priority_cached_tokens_weight >= 0.0
+        assert self.resumable_priority_remaining_prefill_tokens_weight >= 0.0
+        assert self.resumable_priority_waiting_time_weight >= 0.0
+        assert self.resumable_priority_preempt_count_weight >= 0.0
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

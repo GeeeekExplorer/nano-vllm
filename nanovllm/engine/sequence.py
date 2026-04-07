@@ -29,6 +29,9 @@ class Sequence:
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
         self.scheduled_tokens = 0
+        self.preempt_count = 0
+        self.waiting_since = 0
+        self.max_context_tokens_seen = 0
 
     def __len__(self):
         return self.num_tokens
@@ -82,6 +85,12 @@ class Sequence:
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1
+
+    def count_recomputed_prefill_tokens(self, num_query_tokens: int):
+        if num_query_tokens <= 0 or self.num_computed_tokens >= self.max_context_tokens_seen:
+            return 0
+        prefill_end = self.num_computed_tokens + num_query_tokens
+        return max(0, min(prefill_end, self.max_context_tokens_seen) - self.num_computed_tokens)
 
     def __getstate__(self):
         needs_full_tokens = (

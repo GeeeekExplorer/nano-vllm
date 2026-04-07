@@ -56,10 +56,25 @@ class BlockManager:
     def can_allocate(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= seq.num_blocks
 
+    def count_cached_tokens(self, seq: Sequence) -> int:
+        h = -1
+        cache_hit_tokens = 0
+        for i in range(seq.num_blocks):
+            token_ids = seq.block(i)
+            if len(token_ids) != self.block_size:
+                break
+            h = self.compute_hash(token_ids, h)
+            block_id = self.hash_to_block_id.get(h, -1)
+            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+                break
+            cache_hit_tokens += self.block_size
+        return cache_hit_tokens
+
     def allocate(self, seq: Sequence):
         assert not seq.block_table
         h = -1
         cache_miss = False
+        cache_hit_tokens = 0
         for i in range(seq.num_blocks):
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1
@@ -71,6 +86,7 @@ class BlockManager:
                 block = self._allocate_block(block_id)
             else:
                 seq.num_computed_tokens += self.block_size
+                cache_hit_tokens += self.block_size
                 if block_id in self.used_block_ids:
                     block = self.blocks[block_id]
                     block.ref_count += 1
@@ -80,6 +96,7 @@ class BlockManager:
                 block.update(h, token_ids)
                 self.hash_to_block_id[h] = block_id
             seq.block_table.append(block_id)
+        return cache_hit_tokens
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
