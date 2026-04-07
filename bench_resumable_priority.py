@@ -195,6 +195,9 @@ def aggregate_trial_results(mode_name: str, runs: list[dict]) -> dict:
         "avg_recomputed_decode_context_tokens_per_request",
         "avg_recomputed_prefill_tokens_per_request",
         "avg_prefix_cache_hit_tokens_per_request",
+        "total_preemptions",
+        "preempted_requests",
+        "max_preempt_count",
     ]
     out = dict(runs[0])
     out["mode"] = mode_name
@@ -223,6 +226,7 @@ def run_once(
     cb_prefill_min_seqs: int,
     tensor_parallel_size: int,
     enforce_eager: bool,
+    gpu_memory_utilization: float,
     enable_resumable_priority: bool,
     resumable_priority_cached_tokens_weight: float,
     resumable_priority_remaining_prefill_tokens_weight: float,
@@ -244,6 +248,7 @@ def run_once(
         cb_prefill_min_seqs=cb_prefill_min_seqs,
         tensor_parallel_size=tensor_parallel_size,
         enforce_eager=enforce_eager,
+        gpu_memory_utilization=gpu_memory_utilization,
         enable_resumable_priority=enable_resumable_priority,
         resumable_priority_cached_tokens_weight=resumable_priority_cached_tokens_weight,
         resumable_priority_remaining_prefill_tokens_weight=resumable_priority_remaining_prefill_tokens_weight,
@@ -252,6 +257,7 @@ def run_once(
         resumable_priority_min_cached_tokens=resumable_priority_min_cached_tokens,
     )
     stats: dict[int, RequestStat] = {}
+    seqs = {}
     sp_cache: dict[int, SamplingParams] = {}
     total_reqs = len(requests)
     total_recomputed_prompt_tokens = 0
@@ -284,6 +290,7 @@ def run_once(
             while next_idx < total_reqs and now - t0 >= arrivals[next_idx]:
                 req = requests[next_idx]
                 seq = llm.add_request(req.prompt_tokens, get_sp(req.output_len))
+                seqs[seq.seq_id] = seq
                 stats[seq.seq_id] = RequestStat(
                     req_id=req.req_id,
                     tier=req.tier,
@@ -335,6 +342,9 @@ def run_once(
         first_arrival = t0
     makespan_s = max(t_end - first_arrival, 1e-9)
     summary = summarize_request_stats(list(stats.values()))
+    total_preemptions = sum(seq.preempt_count for seq in seqs.values())
+    preempted_requests = sum(1 for seq in seqs.values() if seq.preempt_count > 0)
+    max_preempt_count = max((seq.preempt_count for seq in seqs.values()), default=0)
     return {
         "mode": mode_name,
         "num_requests": total_reqs,
@@ -355,6 +365,9 @@ def run_once(
         "avg_recomputed_decode_context_tokens_per_request": total_recomputed_decode_context_tokens / total_reqs,
         "avg_recomputed_prefill_tokens_per_request": total_recomputed_prefill_tokens / total_reqs,
         "avg_prefix_cache_hit_tokens_per_request": total_prefix_cache_hit_tokens / total_reqs,
+        "total_preemptions": total_preemptions,
+        "preempted_requests": preempted_requests,
+        "max_preempt_count": max_preempt_count,
         "enable_resumable_priority": enable_resumable_priority,
     }
 
@@ -412,6 +425,9 @@ def print_report(priority_off: dict, priority_on: dict):
         ),
         ("Recomputed prefill tokens", priority_off["recomputed_prefill_tokens"], priority_on["recomputed_prefill_tokens"], True),
         ("Prefix cache hit tokens", priority_off["prefix_cache_hit_tokens"], priority_on["prefix_cache_hit_tokens"], False),
+        ("Total preemptions", priority_off["total_preemptions"], priority_on["total_preemptions"], True),
+        ("Preempted requests", priority_off["preempted_requests"], priority_on["preempted_requests"], True),
+        ("Max preempt count", priority_off["max_preempt_count"], priority_on["max_preempt_count"], True),
         (
             "Avg recomputed prompt / req",
             priority_off["avg_recomputed_prompt_tokens_per_request"],
@@ -445,7 +461,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Benchmark resumable-priority scheduling under CB+CP")
     parser.add_argument("--model", type=str, default=os.path.expanduser("~/huggingface/Qwen3-0.6B/"))
     parser.add_argument("--num-requests", type=int, default=256)
-    parser.add_argument("--arrival-interval-ms", type=int, default=20)
+    parser.add_argument("--arrival-interval-ms", type=int, default=10)
     parser.add_argument("--arrival-pattern", choices=["fixed", "poisson"], default="poisson")
     parser.add_argument("--workload-profile", choices=["uniform", "hetero"], default="hetero")
     parser.add_argument("--prompt-len", type=int, default=64)
@@ -454,10 +470,10 @@ def parse_args():
     parser.add_argument("--short-ratio", type=float, default=0.8)
     parser.add_argument("--short-prompt-len", type=int, default=64)
     parser.add_argument("--short-prompt-jitter", type=int, default=16)
-    parser.add_argument("--short-output-len", type=int, default=128)
+    parser.add_argument("--short-output-len", type=int, default=32)
     parser.add_argument("--long-prompt-len", type=int, default=4096)
     parser.add_argument("--long-prompt-jitter", type=int, default=256)
-    parser.add_argument("--long-output-len", type=int, default=128)
+    parser.add_argument("--long-output-len", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
@@ -472,6 +488,7 @@ def parse_args():
     parser.add_argument("--cb-prefill-min-seqs", type=int, default=1)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.5)
     parser.add_argument("--resumable-priority-cached-tokens-weight", type=float, default=4.0)
     parser.add_argument("--resumable-priority-remaining-prefill-tokens-weight", type=float, default=1.0)
     parser.add_argument("--resumable-priority-waiting-time-weight", type=float, default=0.0)
@@ -490,6 +507,7 @@ def main():
     assert args.max_num_seqs > 0, "max-num-seqs must be > 0"
     assert args.max_num_batched_tokens > 0, "max-num-batched-tokens must be > 0"
     assert args.chunked_prefill_size > 0, "chunked-prefill-size must be > 0"
+    assert 0.0 < args.gpu_memory_utilization <= 1.0, "gpu-memory-utilization must be in (0, 1]"
     assert 0.0 <= args.cb_prefill_reserve_ratio <= 1.0, "cb-prefill-reserve-ratio must be in [0, 1]"
     assert args.cb_prefill_min_tokens >= 0, "cb-prefill-min-tokens must be >= 0"
     assert args.cb_prefill_min_seqs >= 0, "cb-prefill-min-seqs must be >= 0"
@@ -523,6 +541,7 @@ def main():
         cb_prefill_min_seqs=args.cb_prefill_min_seqs,
         tensor_parallel_size=args.tensor_parallel_size,
         enforce_eager=args.enforce_eager,
+        gpu_memory_utilization=args.gpu_memory_utilization,
         resumable_priority_cached_tokens_weight=args.resumable_priority_cached_tokens_weight,
         resumable_priority_remaining_prefill_tokens_weight=args.resumable_priority_remaining_prefill_tokens_weight,
         resumable_priority_waiting_time_weight=args.resumable_priority_waiting_time_weight,
