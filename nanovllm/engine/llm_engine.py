@@ -58,6 +58,8 @@ class LLMEngine:
         num_decode_tokens = sum(item.num_query_tokens for item in batch.items if item.is_decode)
         num_total_tokens = num_prefill_tokens + num_decode_tokens
         prefix_cache_hit_tokens = sum(item.prefix_cache_hit_tokens for item in batch.items)
+        recomputed_prompt_tokens = sum(item.recomputed_prompt_tokens for item in batch.items)
+        recomputed_decode_context_tokens = sum(item.recomputed_decode_context_tokens for item in batch.items)
         recomputed_prefill_tokens = sum(item.recomputed_prefill_tokens for item in batch.items)
         if self.scheduler.enable_continuous_batching:
             num_tokens = num_total_tokens
@@ -77,10 +79,14 @@ class LLMEngine:
                 "num_decode_tokens": num_decode_tokens,
                 "num_total_tokens": num_total_tokens,
                 "prefix_cache_hit_tokens": prefix_cache_hit_tokens,
+                "recomputed_prompt_tokens": recomputed_prompt_tokens,
+                "recomputed_decode_context_tokens": recomputed_decode_context_tokens,
                 "recomputed_prefill_tokens": recomputed_prefill_tokens,
                 "is_prefill": legacy_is_prefill if not self.scheduler.enable_continuous_batching else None,
                 "scheduled_prefill_tokens": [item.num_query_tokens if not item.is_decode else 0 for item in batch.items],
                 "scheduled_prefix_cache_hit_tokens": [item.prefix_cache_hit_tokens for item in batch.items],
+                "scheduled_recomputed_prompt_tokens": [item.recomputed_prompt_tokens for item in batch.items],
+                "scheduled_recomputed_decode_context_tokens": [item.recomputed_decode_context_tokens for item in batch.items],
                 "scheduled_recomputed_prefill_tokens": [item.recomputed_prefill_tokens for item in batch.items],
             }
             return outputs, num_tokens, metadata

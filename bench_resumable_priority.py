@@ -187,8 +187,12 @@ def aggregate_trial_results(mode_name: str, runs: list[dict]) -> dict:
         "p95_latency_ms",
         "p99_latency_ms",
         "makespan_s",
+        "recomputed_prompt_tokens",
+        "recomputed_decode_context_tokens",
         "recomputed_prefill_tokens",
         "prefix_cache_hit_tokens",
+        "avg_recomputed_prompt_tokens_per_request",
+        "avg_recomputed_decode_context_tokens_per_request",
         "avg_recomputed_prefill_tokens_per_request",
         "avg_prefix_cache_hit_tokens_per_request",
     ]
@@ -248,6 +252,8 @@ def run_once(
     stats: dict[int, RequestStat] = {}
     sp_cache: dict[int, SamplingParams] = {}
     total_reqs = len(requests)
+    total_recomputed_prompt_tokens = 0
+    total_recomputed_decode_context_tokens = 0
     total_recomputed_prefill_tokens = 0
     total_prefix_cache_hit_tokens = 0
 
@@ -297,6 +303,8 @@ def run_once(
 
             _, _, metadata = llm.step(return_metadata=True)
             step_ts = time.perf_counter()
+            total_recomputed_prompt_tokens += metadata["recomputed_prompt_tokens"]
+            total_recomputed_decode_context_tokens += metadata["recomputed_decode_context_tokens"]
             total_recomputed_prefill_tokens += metadata["recomputed_prefill_tokens"]
             total_prefix_cache_hit_tokens += metadata["prefix_cache_hit_tokens"]
 
@@ -337,8 +345,12 @@ def run_once(
         "p95_latency_ms": summary["p95_latency_ms"],
         "p99_latency_ms": summary["p99_latency_ms"],
         "makespan_s": makespan_s,
+        "recomputed_prompt_tokens": total_recomputed_prompt_tokens,
+        "recomputed_decode_context_tokens": total_recomputed_decode_context_tokens,
         "recomputed_prefill_tokens": total_recomputed_prefill_tokens,
         "prefix_cache_hit_tokens": total_prefix_cache_hit_tokens,
+        "avg_recomputed_prompt_tokens_per_request": total_recomputed_prompt_tokens / total_reqs,
+        "avg_recomputed_decode_context_tokens_per_request": total_recomputed_decode_context_tokens / total_reqs,
         "avg_recomputed_prefill_tokens_per_request": total_recomputed_prefill_tokens / total_reqs,
         "avg_prefix_cache_hit_tokens_per_request": total_prefix_cache_hit_tokens / total_reqs,
         "enable_resumable_priority": enable_resumable_priority,
@@ -389,8 +401,27 @@ def print_report(priority_off: dict, priority_on: dict):
         ("Avg latency (ms)", priority_off["avg_latency_ms"], priority_on["avg_latency_ms"], True),
         ("P95 latency (ms)", priority_off["p95_latency_ms"], priority_on["p95_latency_ms"], True),
         ("Makespan (s)", priority_off["makespan_s"], priority_on["makespan_s"], True),
+        ("Recomputed prompt tokens", priority_off["recomputed_prompt_tokens"], priority_on["recomputed_prompt_tokens"], True),
+        (
+            "Recomputed decode ctx tokens",
+            priority_off["recomputed_decode_context_tokens"],
+            priority_on["recomputed_decode_context_tokens"],
+            True,
+        ),
         ("Recomputed prefill tokens", priority_off["recomputed_prefill_tokens"], priority_on["recomputed_prefill_tokens"], True),
         ("Prefix cache hit tokens", priority_off["prefix_cache_hit_tokens"], priority_on["prefix_cache_hit_tokens"], False),
+        (
+            "Avg recomputed prompt / req",
+            priority_off["avg_recomputed_prompt_tokens_per_request"],
+            priority_on["avg_recomputed_prompt_tokens_per_request"],
+            True,
+        ),
+        (
+            "Avg recomputed decode ctx / req",
+            priority_off["avg_recomputed_decode_context_tokens_per_request"],
+            priority_on["avg_recomputed_decode_context_tokens_per_request"],
+            True,
+        ),
         (
             "Avg recomputed prefill / req",
             priority_off["avg_recomputed_prefill_tokens_per_request"],

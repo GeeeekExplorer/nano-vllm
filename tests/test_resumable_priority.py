@@ -119,7 +119,7 @@ def make_scheduler(enable_resumable_priority: bool, **overrides) -> Scheduler:
 def test_resumable_priority_prefers_high_score_recovery_seq():
     reset_sequence_state()
 
-    def build_case(enable_resumable_priority: bool):
+    def build_case(enable_resumable_priority: bool, preempt_count: int):
         scheduler = make_scheduler(
             enable_resumable_priority,
             max_num_batched_tokens=2,
@@ -131,17 +131,21 @@ def test_resumable_priority_prefers_high_score_recovery_seq():
         batch = scheduler.schedule()
         scheduler.postprocess(batch, [7])
 
-        recovered.preempt_count = 4
+        recovered.preempt_count = preempt_count
         newcomer = Sequence([2, 2], SamplingParams(max_tokens=4, ignore_eos=True))
         scheduler.add(newcomer)
         scheduler.waiting = deque([newcomer, recovered])
         return scheduler, newcomer, recovered
 
-    scheduler_off, newcomer_off, _ = build_case(False)
+    scheduler_off, newcomer_off, _ = build_case(False, 4)
     batch_off = scheduler_off.schedule()
     assert batch_off.items[0].seq.seq_id == newcomer_off.seq_id
 
-    scheduler_on, _, recovered_on = build_case(True)
+    scheduler_on, newcomer_on, _ = build_case(True, 0)
+    batch_on = scheduler_on.schedule()
+    assert batch_on.items[0].seq.seq_id == newcomer_on.seq_id
+
+    scheduler_on, _, recovered_on = build_case(True, 4)
     batch_on = scheduler_on.schedule()
     assert batch_on.items[0].seq.seq_id == recovered_on.seq_id
 
@@ -159,13 +163,36 @@ def test_resume_metrics_track_prefix_hits_and_recompute():
     resumed_batch = scheduler.schedule()
     resumed_item = resumed_batch.items[0]
     assert resumed_item.prefix_cache_hit_tokens == 4
+    assert resumed_item.recomputed_prompt_tokens == 1
+    assert resumed_item.recomputed_decode_context_tokens == 0
     assert resumed_item.recomputed_prefill_tokens == 1
 
 
-def test_resumable_priority_reduces_recomputed_prefill_after_cache_eviction():
+def test_resume_metrics_split_decode_context_recompute():
+    reset_sequence_state()
+    scheduler = make_scheduler(False, max_num_batched_tokens=16, chunked_prefill_size=16, num_kvcache_blocks=6)
+    seq = Sequence([1, 2, 3, 4], SamplingParams(max_tokens=4, ignore_eos=True))
+    scheduler.add(seq)
+
+    prompt_batch = scheduler.schedule()
+    scheduler.postprocess(prompt_batch, [5])
+
+    decode_batch = scheduler.schedule()
+    scheduler.postprocess(decode_batch, [6])
+
+    scheduler.preempt(seq)
+    resumed_batch = scheduler.schedule()
+    resumed_item = resumed_batch.items[0]
+    assert resumed_item.prefix_cache_hit_tokens == 4
+    assert resumed_item.recomputed_prompt_tokens == 0
+    assert resumed_item.recomputed_decode_context_tokens == 1
+    assert resumed_item.recomputed_prefill_tokens == 1
+
+
+def test_resumable_priority_reduces_recomputed_prompt_tokens_after_cache_eviction():
     reset_sequence_state()
 
-    def run_scenario(enable_resumable_priority: bool) -> tuple[int, int]:
+    def run_scenario(enable_resumable_priority: bool) -> tuple[int, int, int]:
         scheduler = make_scheduler(enable_resumable_priority, num_kvcache_blocks=3)
         victim = Sequence([1, 2, 3, 4, 5], SamplingParams(max_tokens=8, ignore_eos=True))
         scheduler.add(victim)
@@ -184,21 +211,26 @@ def test_resumable_priority_reduces_recomputed_prefill_after_cache_eviction():
             evictors.append(evictor)
         scheduler.waiting = deque([*evictors, victim])
 
+        total_recomputed_prompt_tokens = 0
         total_recomputed_prefill_tokens = 0
         total_prefix_cache_hit_tokens = 0
         while True:
             batch = scheduler.schedule()
             item = batch.items[0]
+            total_recomputed_prompt_tokens += item.recomputed_prompt_tokens
             total_recomputed_prefill_tokens += item.recomputed_prefill_tokens
             total_prefix_cache_hit_tokens += item.prefix_cache_hit_tokens
             token_id = -1 if item.seq in evictors else 7
             scheduler.postprocess(batch, [token_id])
             if item.seq.seq_id == victim.seq_id:
-                return total_recomputed_prefill_tokens, total_prefix_cache_hit_tokens
+                return total_recomputed_prompt_tokens, total_recomputed_prefill_tokens, total_prefix_cache_hit_tokens
 
-    off_recomputed, off_cache_hits = run_scenario(False)
-    on_recomputed, on_cache_hits = run_scenario(True)
+    off_prompt_recomputed, off_recomputed, off_cache_hits = run_scenario(False)
+    on_prompt_recomputed, on_recomputed, on_cache_hits = run_scenario(True)
 
+    assert off_prompt_recomputed == 5
+    assert on_prompt_recomputed == 1
+    assert off_prompt_recomputed > on_prompt_recomputed
     assert off_recomputed == 5
     assert on_recomputed == 1
     assert off_recomputed > on_recomputed

@@ -13,6 +13,8 @@ class ScheduledItem:
     should_sample: bool
     is_decode: bool
     prefix_cache_hit_tokens: int = 0
+    recomputed_prompt_tokens: int = 0
+    recomputed_decode_context_tokens: int = 0
     recomputed_prefill_tokens: int = 0
 
 
@@ -81,6 +83,8 @@ class Scheduler:
         best_key = None
         for idx, seq in enumerate(self.waiting):
             if scheduled_seq_ids is not None and seq.seq_id in scheduled_seq_ids:
+                continue
+            if seq.preempt_count <= 0:
                 continue
             if not seq.block_table and not self.block_manager.can_allocate(seq):
                 continue
@@ -218,8 +222,7 @@ class Scheduler:
                 break
 
             if self.enable_resumable_priority:
-                if not self._promote_priority_waiting(scheduled_seq_ids):
-                    break
+                self._promote_priority_waiting(scheduled_seq_ids)
             seq = self.waiting[0]
             if seq.seq_id in scheduled_seq_ids:
                 break
@@ -227,8 +230,8 @@ class Scheduler:
             prefix_cache_hit_tokens = 0
             if not seq.block_table:
                 if not self.block_manager.can_allocate(seq):
-                    if self.enable_resumable_priority:
-                        break
+                    if self.enable_resumable_priority and self._promote_priority_waiting(scheduled_seq_ids):
+                        continue
                     if self._promote_resumable_waiting(scheduled_seq_ids):
                         continue
                     break
@@ -261,7 +264,7 @@ class Scheduler:
                 break
 
             self.waiting.popleft()
-            recomputed_prefill_tokens = seq.count_recomputed_prefill_tokens(num_query_tokens)
+            recomputed_prompt_tokens, recomputed_decode_context_tokens = seq.count_recomputed_prefill_tokens(num_query_tokens)
             seq.scheduled_tokens = num_query_tokens
             should_sample = seq.num_computed_tokens + num_query_tokens >= len(seq)
             seq.status = SequenceStatus.RUNNING if should_sample else SequenceStatus.WAITING
@@ -276,7 +279,9 @@ class Scheduler:
                     should_sample,
                     False,
                     prefix_cache_hit_tokens=prefix_cache_hit_tokens,
-                    recomputed_prefill_tokens=recomputed_prefill_tokens,
+                    recomputed_prompt_tokens=recomputed_prompt_tokens,
+                    recomputed_decode_context_tokens=recomputed_decode_context_tokens,
+                    recomputed_prefill_tokens=recomputed_prompt_tokens + recomputed_decode_context_tokens,
                 )
             )
             scheduled_seq_ids.add(seq.seq_id)
@@ -369,8 +374,7 @@ class Scheduler:
         num_batched_tokens = 0
         while self.waiting and num_seqs < self.max_num_seqs:
             if self.enable_resumable_priority:
-                if not self._promote_priority_waiting(scheduled_seq_ids):
-                    break
+                self._promote_priority_waiting(scheduled_seq_ids)
             seq = self.waiting[0]
             if seq.seq_id in scheduled_seq_ids:
                 break
@@ -378,8 +382,8 @@ class Scheduler:
             prefix_cache_hit_tokens = 0
             if not seq.block_table:
                 if not self.block_manager.can_allocate(seq):
-                    if self.enable_resumable_priority:
-                        break
+                    if self.enable_resumable_priority and self._promote_priority_waiting(scheduled_seq_ids):
+                        continue
                     if self._promote_resumable_waiting(scheduled_seq_ids):
                         continue
                     break
@@ -413,7 +417,7 @@ class Scheduler:
             num_batched_tokens += num_query_tokens
             self.waiting.popleft()
             scheduled_seq_ids.add(seq.seq_id)
-            recomputed_prefill_tokens = seq.count_recomputed_prefill_tokens(num_query_tokens)
+            recomputed_prompt_tokens, recomputed_decode_context_tokens = seq.count_recomputed_prefill_tokens(num_query_tokens)
             should_sample = seq.num_computed_tokens + num_query_tokens >= seq.num_prompt_tokens
             seq.scheduled_tokens = num_query_tokens
             seq.status = SequenceStatus.RUNNING if should_sample else SequenceStatus.WAITING
@@ -424,7 +428,9 @@ class Scheduler:
                     should_sample,
                     False,
                     prefix_cache_hit_tokens=prefix_cache_hit_tokens,
-                    recomputed_prefill_tokens=recomputed_prefill_tokens,
+                    recomputed_prompt_tokens=recomputed_prompt_tokens,
+                    recomputed_decode_context_tokens=recomputed_decode_context_tokens,
+                    recomputed_prefill_tokens=recomputed_prompt_tokens + recomputed_decode_context_tokens,
                 )
             )
             if should_sample:
