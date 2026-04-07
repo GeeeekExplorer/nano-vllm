@@ -107,6 +107,7 @@ def make_scheduler(enable_resumable_priority: bool, **overrides) -> Scheduler:
         resumable_priority_remaining_prefill_tokens_weight=1.0,
         resumable_priority_waiting_time_weight=1.0,
         resumable_priority_preempt_count_weight=1.0,
+        resumable_priority_min_cached_tokens=4,
         eos=-1,
         num_kvcache_blocks=4,
         kvcache_block_size=4,
@@ -122,15 +123,15 @@ def test_resumable_priority_prefers_high_score_recovery_seq():
     def build_case(enable_resumable_priority: bool, preempt_count: int):
         scheduler = make_scheduler(
             enable_resumable_priority,
-            max_num_batched_tokens=2,
-            chunked_prefill_size=2,
+            max_num_batched_tokens=4,
+            chunked_prefill_size=4,
             num_kvcache_blocks=6,
         )
         recovered = Sequence([1] * 8, SamplingParams(max_tokens=4, ignore_eos=True))
         scheduler.add(recovered)
         batch = scheduler.schedule()
         scheduler.postprocess(batch, [7])
-
+        scheduler.preempt(recovered)
         recovered.preempt_count = preempt_count
         newcomer = Sequence([2, 2], SamplingParams(max_tokens=4, ignore_eos=True))
         scheduler.add(newcomer)
@@ -166,6 +167,24 @@ def test_resume_metrics_track_prefix_hits_and_recompute():
     assert resumed_item.recomputed_prompt_tokens == 1
     assert resumed_item.recomputed_decode_context_tokens == 0
     assert resumed_item.recomputed_prefill_tokens == 1
+
+
+def test_resumable_priority_skips_preempted_seq_without_cache():
+    reset_sequence_state()
+    scheduler = make_scheduler(True, max_num_batched_tokens=2, chunked_prefill_size=2, num_kvcache_blocks=6)
+    recovered = Sequence([1, 2, 3], SamplingParams(max_tokens=4, ignore_eos=True))
+    scheduler.add(recovered)
+    batch = scheduler.schedule()
+    scheduler.postprocess(batch, [7])
+    scheduler.preempt(recovered)
+    recovered.preempt_count = 4
+
+    newcomer = Sequence([8, 9], SamplingParams(max_tokens=4, ignore_eos=True))
+    scheduler.add(newcomer)
+    scheduler.waiting = deque([newcomer, recovered])
+
+    batch = scheduler.schedule()
+    assert batch.items[0].seq.seq_id == newcomer.seq_id
 
 
 def test_resume_metrics_split_decode_context_recompute():

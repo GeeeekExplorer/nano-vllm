@@ -21,6 +21,7 @@ class Config:
     resumable_priority_remaining_prefill_tokens_weight: float = 1.0
     resumable_priority_waiting_time_weight: float = 1.0
     resumable_priority_preempt_count_weight: float = 1.0
+    resumable_priority_min_cached_tokens: int = -1
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
@@ -40,6 +41,7 @@ class Config:
         assert self.resumable_priority_remaining_prefill_tokens_weight >= 0.0
         assert self.resumable_priority_waiting_time_weight >= 0.0
         assert self.resumable_priority_preempt_count_weight >= 0.0
+        assert self.resumable_priority_min_cached_tokens >= -1
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

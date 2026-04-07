@@ -228,6 +228,7 @@ def run_once(
     resumable_priority_remaining_prefill_tokens_weight: float,
     resumable_priority_waiting_time_weight: float,
     resumable_priority_preempt_count_weight: float,
+    resumable_priority_min_cached_tokens: int,
 ) -> dict:
     llm = LLM(
         model,
@@ -248,6 +249,7 @@ def run_once(
         resumable_priority_remaining_prefill_tokens_weight=resumable_priority_remaining_prefill_tokens_weight,
         resumable_priority_waiting_time_weight=resumable_priority_waiting_time_weight,
         resumable_priority_preempt_count_weight=resumable_priority_preempt_count_weight,
+        resumable_priority_min_cached_tokens=resumable_priority_min_cached_tokens,
     )
     stats: dict[int, RequestStat] = {}
     sp_cache: dict[int, SamplingParams] = {}
@@ -442,38 +444,39 @@ def print_report(priority_off: dict, priority_on: dict):
 def parse_args():
     parser = argparse.ArgumentParser(description="Benchmark resumable-priority scheduling under CB+CP")
     parser.add_argument("--model", type=str, default=os.path.expanduser("~/huggingface/Qwen3-0.6B/"))
-    parser.add_argument("--num-requests", type=int, default=500)
-    parser.add_argument("--arrival-interval-ms", type=int, default=50)
+    parser.add_argument("--num-requests", type=int, default=256)
+    parser.add_argument("--arrival-interval-ms", type=int, default=20)
     parser.add_argument("--arrival-pattern", choices=["fixed", "poisson"], default="poisson")
     parser.add_argument("--workload-profile", choices=["uniform", "hetero"], default="hetero")
     parser.add_argument("--prompt-len", type=int, default=64)
     parser.add_argument("--prompt-jitter", type=int, default=8)
     parser.add_argument("--output-len", type=int, default=64)
-    parser.add_argument("--short-ratio", type=float, default=0.7)
+    parser.add_argument("--short-ratio", type=float, default=0.8)
     parser.add_argument("--short-prompt-len", type=int, default=64)
     parser.add_argument("--short-prompt-jitter", type=int, default=16)
-    parser.add_argument("--short-output-len", type=int, default=64)
-    parser.add_argument("--long-prompt-len", type=int, default=1024)
-    parser.add_argument("--long-prompt-jitter", type=int, default=128)
-    parser.add_argument("--long-output-len", type=int, default=256)
+    parser.add_argument("--short-output-len", type=int, default=128)
+    parser.add_argument("--long-prompt-len", type=int, default=4096)
+    parser.add_argument("--long-prompt-jitter", type=int, default=256)
+    parser.add_argument("--long-output-len", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--trials", type=int, default=1)
-    parser.add_argument("--max-model-len", type=int, default=4096)
+    parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--max-num-seqs", type=int, default=512)
-    parser.add_argument("--max-num-batched-tokens", type=int, default=16384)
-    parser.add_argument("--chunked-prefill-size", type=int, default=1024)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=4096)
+    parser.add_argument("--chunked-prefill-size", type=int, default=256)
     parser.add_argument("--disable-cb-prefill-liveness", action="store_true")
     parser.add_argument("--cb-prefill-reserve-ratio", type=float, default=0.2)
     parser.add_argument("--cb-prefill-min-tokens", type=int, default=512)
     parser.add_argument("--cb-prefill-min-seqs", type=int, default=1)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--enforce-eager", action="store_true")
-    parser.add_argument("--resumable-priority-cached-tokens-weight", type=float, default=1.0)
+    parser.add_argument("--resumable-priority-cached-tokens-weight", type=float, default=4.0)
     parser.add_argument("--resumable-priority-remaining-prefill-tokens-weight", type=float, default=1.0)
-    parser.add_argument("--resumable-priority-waiting-time-weight", type=float, default=1.0)
-    parser.add_argument("--resumable-priority-preempt-count-weight", type=float, default=1.0)
+    parser.add_argument("--resumable-priority-waiting-time-weight", type=float, default=0.0)
+    parser.add_argument("--resumable-priority-preempt-count-weight", type=float, default=64.0)
+    parser.add_argument("--resumable-priority-min-cached-tokens", type=int, default=256)
     parser.add_argument("--output-json", type=str, default="")
     return parser.parse_args()
 
@@ -494,6 +497,7 @@ def main():
     assert args.resumable_priority_remaining_prefill_tokens_weight >= 0.0
     assert args.resumable_priority_waiting_time_weight >= 0.0
     assert args.resumable_priority_preempt_count_weight >= 0.0
+    assert args.resumable_priority_min_cached_tokens >= -1
     if args.workload_profile == "uniform":
         assert args.prompt_len > 0 and args.output_len > 0
     else:
@@ -523,6 +527,7 @@ def main():
         resumable_priority_remaining_prefill_tokens_weight=args.resumable_priority_remaining_prefill_tokens_weight,
         resumable_priority_waiting_time_weight=args.resumable_priority_waiting_time_weight,
         resumable_priority_preempt_count_weight=args.resumable_priority_preempt_count_weight,
+        resumable_priority_min_cached_tokens=args.resumable_priority_min_cached_tokens,
     )
 
     print("Running resume_priority_off (CB=ON, CP=ON, resumable-priority=OFF) ...")

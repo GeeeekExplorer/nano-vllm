@@ -40,6 +40,11 @@ class Scheduler:
         self.resumable_priority_remaining_prefill_tokens_weight = config.resumable_priority_remaining_prefill_tokens_weight
         self.resumable_priority_waiting_time_weight = config.resumable_priority_waiting_time_weight
         self.resumable_priority_preempt_count_weight = config.resumable_priority_preempt_count_weight
+        self.resumable_priority_min_cached_tokens = (
+            config.kvcache_block_size
+            if config.resumable_priority_min_cached_tokens < 0
+            else config.resumable_priority_min_cached_tokens
+        )
         self.schedule_decode_next = False
         self.schedule_tick = 0
         self.eos = config.eos
@@ -89,6 +94,8 @@ class Scheduler:
             if not seq.block_table and not self.block_manager.can_allocate(seq):
                 continue
             score, cached_tokens, remaining_prefill_tokens, waiting_time = self._compute_resumable_priority_score(seq)
+            if cached_tokens < self.resumable_priority_min_cached_tokens:
+                continue
             key = (
                 score,
                 waiting_time,
