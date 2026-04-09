@@ -132,7 +132,9 @@ class Qwen3DecoderLayer(nn.Module):
             qkv_bias=getattr(config, 'attention_bias', True),
             head_dim=getattr(config, 'head_dim', None),
             rope_theta=getattr(config, "rope_theta", 1000000),
-            rope_scaling=getattr(config, "rope_scaling", None),
+            rope_scaling=None,
+            # RoPE scaling is not implemented yet in nano-vllm rotary_embedding.get_rope,
+            # so pass None explicitly to avoid unhashable dict errors with newer transformers.
         )
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,
