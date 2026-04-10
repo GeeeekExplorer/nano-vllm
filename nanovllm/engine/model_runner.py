@@ -134,9 +134,15 @@ class ModelRunner:
         block_tables = None
         for seq in seqs:
             seqlen = len(seq)
-            input_ids.extend(seq[seq.num_cached_tokens:])
-            positions.extend(list(range(seq.num_cached_tokens, seqlen)))
-            seqlen_q = seqlen - seq.num_cached_tokens
+
+            is_fully_cached = (seq.num_cached_tokens == seqlen)
+            num_cached_tokens = seq.num_cached_tokens
+            if is_fully_cached:
+                num_cached_tokens -= 1
+
+            input_ids.extend(seq[num_cached_tokens:])
+            positions.extend(list(range(num_cached_tokens, seqlen)))
+            seqlen_q = seqlen - num_cached_tokens
             seqlen_k = seqlen
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
@@ -151,6 +157,9 @@ class ModelRunner:
                 else:
                     end = start + seq.last_block_num_tokens 
                 slot_mapping.extend(list(range(start, end)))
+            if is_fully_cached:
+                slot_mapping.append((seq.block_table[-1] + 1) * self.block_size - 1)
+
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
