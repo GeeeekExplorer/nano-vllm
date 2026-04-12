@@ -8,6 +8,7 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
+from nanovllm.layers.attention_utils import set_connector
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
@@ -33,6 +34,7 @@ class ModelRunner:
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
+        self._maybe_init_cpu_offload_connector()
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
@@ -116,6 +118,24 @@ class ModelRunner:
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
+
+    def _maybe_init_cpu_offload_connector(self) -> None:
+        """根据配置决定是否初始化 CPU Offload Connector。
+
+        Returns:
+            None
+        """
+        # --- 执行逻辑 ---
+        # 1. 检查 config.kv_transfer_config 是否为 None，若是则跳过
+        # 2. 若配置了 kv_connector == "CPUOffloadConnector"：
+        #    a. 从 config 和 hf_config 中提取 num_layers, block_size,
+        #       num_kv_heads, head_dim, dtype 等参数
+        #    b. 创建 CPUOffloadConnector 实例
+        #    c. 调用 connector.initialize() 分配 CPU 内存池并启动 metadata server
+        #    d. 调用 set_connector(connector) 设置全局引用，
+        #       使 Attention 层的 wait_for_kv_layer / maybe_save_kv_layer 能访问到
+        # 3. 若不匹配已知 connector 类型，忽略
+        pass
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
