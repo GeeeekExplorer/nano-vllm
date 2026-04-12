@@ -5,6 +5,10 @@ import triton.language as tl
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
+from nanovllm.layers.attention_utils import (
+    wait_for_kv_layer_from_connector,
+    maybe_save_kv_layer_to_connector,
+)
 
 
 @triton.jit
@@ -48,17 +52,23 @@ class Attention(nn.Module):
         head_dim,
         scale,
         num_kv_heads,
+        layer_name: str = "",
     ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.scale = scale
         self.num_kv_heads = num_kv_heads
+        self.layer_name = layer_name
         self.k_cache = self.v_cache = torch.tensor([])
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
+
+        # --- CPU Offload: prefill 前尝试从 CPU 换入该层 KV Cache ---
+        wait_for_kv_layer_from_connector(self.layer_name, k_cache, v_cache)
+
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
@@ -68,8 +78,11 @@ class Attention(nn.Module):
                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
+
+            # --- CPU Offload: prefill 后尝试将该层 KV Cache 卸载到 CPU ---
+            maybe_save_kv_layer_to_connector(self.layer_name, k_cache, v_cache)
         else:    # decode
             o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, block_table=context.block_tables, 
+                                        cache_seqlens=context.context_lens, block_table=context.block_tables,
                                         softmax_scale=self.scale, causal=True)
         return o
