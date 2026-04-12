@@ -5,9 +5,9 @@ MLA 是 DeepSeek-V2 提出的注意力机制，核心思想：
   - KV Cache 只存 (kv_c, k_pe)，相比标准 MHA 大幅节省显存
   - 计算 Attention 时再通过 kv_b_proj 将 kv_c 展开为完整的 K_nope, V
 
-在昇腾 910C 上进一步优化：
-  - 使用融合算子 npu_kv_rmsnorm_rope_cache 将 RMSNorm + RoPE + Cache 写入一步完成
-  - CPU Offload 时对压缩后的 kv_c / k_pe 做 scatter+burst，数据量远小于完整 KV
+CPU Offload 适配：
+  MLA 的压缩 KV Cache 数据量远小于标准 MHA，
+  使得 GPU↔CPU 卸载的传输量大幅降低，是长上下文场景的关键优化。
 
 对应 vllm-ascend PR #1659 中的 mla_v1.py。
 """
@@ -128,11 +128,11 @@ class MLAAttention(nn.Module):
         # 2. KV 压缩路径：
         #    kv_no_split = kv_a_proj_with_mqa(hidden_states)  # [num_tokens, kv_lora_rank + qk_rope_head_dim]
         #
-        # 3. 在昇腾 910C 上，使用融合算子一步完成 RMSNorm + RoPE + Cache 写入：
-        #    kv_c_normed, k_pe_roped = npu_kv_rmsnorm_rope_cache(
-        #        kv_no_split, cos, sin, self.kv_cache, slot_mapping,
-        #        kv_lora_rank, qk_rope_head_dim)
-        #    （该融合算子在 AI Core 上执行，避免中间张量的 HBM 读写）
+        # 3. 对 kv_c 做 RMSNorm，对 k_pe 施加 RoPE：
+        #    kv_c, k_pe = kv_no_split.split([kv_lora_rank, qk_rope_head_dim], dim=-1)
+        #    kv_c_normed = kv_a_layernorm(kv_c)
+        #    k_pe_roped = rotary_emb(k_pe)
+        #    将 kv_c_normed 和 k_pe_roped 写入 self.kv_cache 对应 slot
         #
         # 4. Prefill 分支：
         #    k_nope, v = kv_b_proj(kv_c_normed) 展开为完整 K_nope 和 V

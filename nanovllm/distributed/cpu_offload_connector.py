@@ -4,11 +4,6 @@
 在 Connector 内部启动 metadata server，管理 CPU KV Cache 并提供
 RPC 调用接口，支持多个 data-parallel EngineCore 实例之间共享 KV Cache。
 对应 vllm-ascend PR #1659 中的 cpu_offload_connector.py。
-
-昇腾 910C 适配：
-  针对达芬奇架构分离式芯片特点，提供 scatter+burst 传输路径——
-  先将分散的小 block 打包为连续 buffer（scatter），
-  再以 burst 模式做 DMA 传输，降低调度和编译开销。
 """
 
 import torch
@@ -152,115 +147,6 @@ class CPUOffloadConnector:
         # --- 执行逻辑 ---
         # 若 GPU 空闲 block 数低于 swap_in_threshold，返回 True
         # 否则返回 False
-        return False
-
-    # ================================================================
-    #  昇腾 910C 专用：scatter + burst 传输路径
-    # ================================================================
-
-    def ascend_swap_out_with_scatter_burst(
-        self,
-        layer_name: str,
-        seq_id: int,
-        npu_k_cache: torch.Tensor,
-        npu_v_cache: torch.Tensor,
-        block_ids: list[int],
-        token_length: int,
-        is_prefill: bool,
-    ) -> bool:
-        """昇腾 910C 优化的 swap out：scatter 打包 + burst DMA 传输。
-
-        标准路径（逐 block 拷贝）在达芬奇架构上的问题：
-          - 每个小 block 需要一次独立的 DMA 事务
-          - 每次 DMA 事务有 ~5μs 的 AI CPU 调度开销
-          - N 个 block → N 次调度 → 调度总开销 = N × 5μs
-          - 编译器需为每个 block 生成独立的 DMA 指令
-
-        本方法的优化策略：
-          1. scatter: 在 NPU 的 AI Core 上将 N 个分散 block 打包到连续 buffer
-             → 仅 1 次算子下发（AI Core 内部并行执行，无 AI CPU 调度）
-          2. burst:  对连续 buffer 做 1 次 DMA burst 传输
-             → 仅 1 次 DMA 调度，充分利用 HBM→DDR 带宽
-          总调度开销：~5μs（1 次 scatter 算子 + 1 次 DMA），而非 N × 5μs
-
-        Args:
-            layer_name:   模型层名称
-            seq_id:       序列 ID
-            npu_k_cache:  NPU 端该层 K cache
-            npu_v_cache:  NPU 端该层 V cache
-            block_ids:    需要卸载的 block ID 列表（在 NPU 显存中可能不连续）
-            token_length: 序列当前 token 长度
-            is_prefill:   是否 prefill 阶段
-
-        Returns:
-            bool: 卸载是否成功
-        """
-        # --- 执行逻辑 ---
-        # 1. 调用 npu_scatter_kv_blocks(npu_k_cache, npu_v_cache, block_ids, block_size)
-        #    在 AI Core 上将分散的 block 打包到连续的 k_packed, v_packed
-        #
-        # 2. 在 CPU 端分配对应大小的 pin_memory buffer：
-        #    cpu_k_buf = torch.empty_like(k_packed, device="cpu", pin_memory=True)
-        #    cpu_v_buf = torch.empty_like(v_packed, device="cpu", pin_memory=True)
-        #
-        # 3. 调用 npu_burst_copy_to_cpu(k_packed, cpu_k_buf) 做 burst DMA
-        #    调用 npu_burst_copy_to_cpu(v_packed, cpu_v_buf)
-        #
-        # 4. 将 cpu_k_buf / cpu_v_buf 写入 manager 的 CPU 存储池
-        #    （按 block 粒度切分后存入 manager.cpu_k_cache / cpu_v_cache）
-        #
-        # 5. 记录 metadata 映射关系
-        # 6. 返回 True
-        return False
-
-    def ascend_swap_in_with_burst_gather(
-        self,
-        layer_name: str,
-        seq_id: int,
-        npu_k_cache: torch.Tensor,
-        npu_v_cache: torch.Tensor,
-        block_ids: list[int],
-        token_length: int,
-        is_prefill: bool,
-    ) -> bool:
-        """昇腾 910C 优化的 swap in：burst DMA 传输 + gather 分发。
-
-        scatter+burst 的逆操作：
-          1. 从 CPU 端拼装连续 buffer
-          2. burst DMA 一次性传输到 NPU
-          3. gather 分发到各 block 位置
-
-        Args:
-            layer_name:   模型层名称
-            seq_id:       序列 ID
-            npu_k_cache:  NPU 端该层 K cache（写入目标）
-            npu_v_cache:  NPU 端该层 V cache（写入目标）
-            block_ids:    需要加载的 block ID 列表
-            token_length: 序列当前 token 长度
-            is_prefill:   是否 prefill 阶段
-
-        Returns:
-            bool: 加载是否成功
-        """
-        # --- 执行逻辑 ---
-        # 1. 从 manager 的 CPU 存储池中读取对应 block 数据，
-        #    拼装为连续的 cpu_k_buf / cpu_v_buf
-        #
-        # 2. 在 NPU 端分配对应大小的连续接收 buffer：
-        #    npu_k_buf = torch.empty_like(cpu_k_buf, device="npu")
-        #    npu_v_buf = torch.empty_like(cpu_v_buf, device="npu")
-        #
-        # 3. 调用 npu_burst_copy_to_npu(cpu_k_buf, npu_k_buf) 做 burst DMA
-        #    调用 npu_burst_copy_to_npu(cpu_v_buf, npu_v_buf)
-        #
-        # 4. 等待 DMA 传输完成（stream 同步，确保数据到达 NPU）
-        #
-        # 5. 调用 npu_gather_kv_blocks(npu_k_buf, npu_v_buf,
-        #        npu_k_cache, npu_v_cache, block_ids, block_size)
-        #    在 AI Core 上将连续 buffer 分发到各 block 位置
-        #
-        # 6. 释放 CPU 端对应 block，更新 metadata
-        # 7. 返回 True
         return False
 
     def close(self) -> None:
