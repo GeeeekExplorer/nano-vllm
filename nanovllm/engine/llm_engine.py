@@ -18,6 +18,7 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        Sequence.set_block_size(config.kvcache_block_size)
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")

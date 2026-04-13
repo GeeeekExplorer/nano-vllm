@@ -12,8 +12,12 @@ class SequenceStatus(Enum):
 
 
 class Sequence:
-    block_size = 256
+    block_size: int = 0  # invalid value, will be set by set_block_size
     counter = count()
+
+    @classmethod
+    def set_block_size(cls, block_size: int):
+        cls.block_size = block_size
 
     def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
         self.seq_id = next(Sequence.counter)
