@@ -12,12 +12,8 @@ class SequenceStatus(Enum):
 
 
 class Sequence:
-    block_size: int = 0  # invalid value, will be set by set_block_size
+    block_size = 256
     counter = count()
-
-    @classmethod
-    def set_block_size(cls, block_size: int):
-        cls.block_size = block_size
 
     def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
         self.seq_id = next(Sequence.counter)
@@ -26,12 +22,12 @@ class Sequence:
         self.last_token = token_ids[-1]
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
-        self.num_cached_tokens = 0
+        self.num_cached_tokens = 0    # tokens that don't need prefill
+        self.num_scheduled_tokens = 0
         self.block_table = []
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
-        self.prefilled = False
 
     def __len__(self):
         return self.num_tokens
@@ -56,10 +52,6 @@ class Sequence:
         return self.token_ids[self.num_prompt_tokens:]
 
     @property
-    def num_cached_blocks(self):
-        return self.num_cached_tokens // self.block_size
-
-    @property
     def num_blocks(self):
         return (self.num_tokens + self.block_size - 1) // self.block_size
 
@@ -75,15 +67,16 @@ class Sequence:
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1
-        self.prefilled = True
 
     def __getstate__(self):
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table, self.prefilled,
-                self.last_token if self.prefilled else self.token_ids)
+        last_state = self.token_ids if self.num_completion_tokens == 0 or self.num_cached_tokens < self.num_tokens else self.last_token
+        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table, self.prefilled = state[:-1]
-        if self.prefilled:
-            self.last_token = state[-1]
+        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state = state
+        if isinstance(last_state, list):
+            self.token_ids = last_state
+            self.last_token = self.token_ids[-1]
         else:
-            self.token_ids = state[-1]
+            self.token_ids = []
+            self.last_token = last_state
