@@ -141,8 +141,7 @@ class RowParallelLinear(LinearBase):
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
-        if param_data.dim() == 1:
-            # bias is not sharded in RowParallelLinear
+        if param_data.ndim == 1:
             param_data.copy_(loaded_weight)
             return
         shard_size = param_data.size(self.tp_dim)
