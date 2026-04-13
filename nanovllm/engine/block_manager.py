@@ -46,7 +46,7 @@ class BlockManager:
         block.reset()
         self.free_block_ids.remove(block_id)
         self.used_block_ids.add(block_id)
-        return self.blocks[block_id]
+        return block
 
     def _deallocate_block(self, block_id: int) -> Block:
         assert self.blocks[block_id].ref_count == 0
@@ -88,7 +88,6 @@ class BlockManager:
             if block.ref_count == 0:
                 self._deallocate_block(block_id)
         seq.num_cached_tokens = 0
-        seq.prefilled = False
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:
