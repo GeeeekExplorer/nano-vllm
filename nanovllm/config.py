@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from transformers import AutoConfig
 
 
-@dataclass
+@dataclass(slots=True)
 class Config:
     model: str
     max_num_batched_tokens: int = 16384
