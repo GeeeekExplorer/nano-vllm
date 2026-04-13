@@ -149,7 +149,7 @@ class ModelRunner:
                 if i != seq.num_blocks - 1:
                     end = start + self.block_size
                 else:
-                    end = start + seq.last_block_num_tokens 
+                    end = start + seq.last_block_num_tokens
                 slot_mapping.extend(list(range(start, end)))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
@@ -162,6 +162,32 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
+        st = getattr(self, "decode_staging", None)
+        if (not self.enforce_eager) and hasattr(self, "graphs") and len(seqs) <= 512 and (st is not None):
+            bs = len(seqs)
+            if bs == 0:
+                set_context(False)
+                return self.decode_staging["input_ids"][:0], self.decode_staging["positions"][:0]
+            bucket = next(x for x in self.graph_bs if x >= bs)
+            st = self.decode_staging
+            st["input_ids"][:bucket].zero_()
+            st["positions"][:bucket].zero_()
+            st["slot_mapping"][:bucket].fill_(-1)
+            st["context_lens"][:bucket].fill_(1)
+            st["block_tables"][:bucket].fill_(-1)
+
+            for i, seq in enumerate(seqs):
+                st["input_ids"][i] = seq.last_token
+                st["positions"][i] = len(seq) - 1
+                st["context_lens"][i] = len(seq)
+                st["slot_mapping"][i] = seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
+                row = st["block_tables"][i]
+                for j, b in enumerate(seq.block_table):
+                    row[j] = b
+
+            set_context(False)
+            return st["input_ids"][:bs], st["positions"][:bs]
+
         input_ids = []
         positions = []
         slot_mapping = []
@@ -192,16 +218,33 @@ class ModelRunner:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
-            context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            bucket = next(x for x in self.graph_bs if x >= bs)
+            graph = self.graphs[bucket]
             graph_vars = self.graph_vars
-            graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"][:bs] = context.context_lens
-            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+
+            if input_ids.device.type == "cpu" and hasattr(self, "decode_staging"):
+                st = self.decode_staging
+                graph_vars["input_ids"][:bucket].copy_(st["input_ids"][:bucket], non_blocking=True)
+                graph_vars["positions"][:bucket].copy_(st["positions"][:bucket], non_blocking=True)
+                graph_vars["slot_mapping"][:bucket].copy_(st["slot_mapping"][:bucket], non_blocking=True)
+                graph_vars["context_lens"][:bucket].copy_(st["context_lens"][:bucket], non_blocking=True)
+                graph_vars["block_tables"][:bucket].copy_(st["block_tables"][:bucket], non_blocking=True)
+            else:
+                context = get_context()
+                graph_vars["input_ids"][:bucket].zero_()
+                graph_vars["positions"][:bucket].zero_()
+                graph_vars["input_ids"][:bs].copy_(input_ids, non_blocking=True)
+                graph_vars["positions"][:bs].copy_(positions, non_blocking=True)
+
+                graph_vars["slot_mapping"][:bucket].fill_(-1)
+                graph_vars["slot_mapping"][:bs].copy_(context.slot_mapping, non_blocking=True)
+
+                graph_vars["context_lens"][:bucket].fill_(1)
+                graph_vars["context_lens"][:bs].copy_(context.context_lens, non_blocking=True)
+
+                graph_vars["block_tables"][:bucket].fill_(-1)
+                graph_vars["block_tables"][:bs, :context.block_tables.size(1)].copy_(context.block_tables, non_blocking=True)
+
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
@@ -248,4 +291,11 @@ class ModelRunner:
             context_lens=context_lens,
             block_tables=block_tables,
             outputs=outputs,
+        )
+        self.decode_staging = dict(
+            input_ids=torch.empty(max_bs, dtype=torch.int64, device="cpu", pin_memory=True),
+            positions=torch.empty(max_bs, dtype=torch.int64, device="cpu", pin_memory=True),
+            slot_mapping=torch.empty(max_bs, dtype=torch.int32, device="cpu", pin_memory=True),
+            context_lens=torch.empty(max_bs, dtype=torch.int32, device="cpu", pin_memory=True),
+            block_tables=torch.empty(max_bs, max_num_blocks, dtype=torch.int32, device="cpu", pin_memory=True),
         )
