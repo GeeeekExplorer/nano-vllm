@@ -10,6 +10,8 @@ from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+from nanovllm.distributed.kv_transfer.connector import PDDisaggConnector
+from nanovllm.distributed.kv_transfer.config_data import ConnectorMetadata
 
 
 class ModelRunner:
@@ -117,6 +119,39 @@ class ModelRunner:
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
 
+        # --- PD 分离: 注册 KV Cache 到分布式传输系统 ---
+        if config.pd_disagg_enabled:
+            self.register_kv_caches_for_disagg()
+
+    def register_kv_caches_for_disagg(self):
+        """
+        将已分配的 KV Cache 注册到 PD 分离连接器的存储后端。
+
+        对应 vllm-ascend PR #950 中 model_runner_v1.py 的 KV Cache 注册逻辑。
+
+        执行逻辑:
+            # 1. 构建 kv_caches 字典: 遍历模型的每一层 Attention 模块，
+            #    收集 k_cache 和 v_cache 的 tensor 引用
+            #    kv_caches = {}
+            #    layer_id = 0
+            #    for module in self.model.modules():
+            #        if hasattr(module, "k_cache"):
+            #            kv_caches[f"layer.{layer_id}.k"] = module.k_cache
+            #            kv_caches[f"layer.{layer_id}.v"] = module.v_cache
+            #            layer_id += 1
+            #
+            # 2. 对于昇腾 NPU，需要确保 KV Cache 满足 4MB 对齐要求:
+            #    - 原始 KV Cache 以单个 tensor 存储 (shape: [2, num_layers, ...])
+            #    - 改为以 tuple 形式分别存储 K 和 V:
+            #      k_cache = align_to_4mb(self.kv_cache[0, layer_id])
+            #      v_cache = align_to_4mb(self.kv_cache[1, layer_id])
+            #    - 其中 align_to_4mb 确保 tensor 的起始地址和大小都是 4MB 的倍数
+            #
+            # 3. 调用连接器注册:
+            #    self.pd_connector.register_kv_caches(kv_caches)
+        """
+        pass
+
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
@@ -205,13 +240,72 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    def run(self, seqs: list[Sequence], is_prefill: bool,
+            connector_metadata: ConnectorMetadata | None = None) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+
+        # --- PD 分离: 前向计算前绑定元数据并发起 KV 加载 ---
+        self.maybe_start_kv_load(connector_metadata)
+
         logits = self.run_model(input_ids, positions, is_prefill)
+
+        # --- PD 分离: 前向计算后等待 KV 保存完成 ---
+        self.maybe_wait_kv_save()
+
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
+
+        # --- PD 分离: 清除元数据 ---
+        self.maybe_clear_connector_metadata()
+
         return token_ids
+
+    def maybe_start_kv_load(self, connector_metadata: ConnectorMetadata | None):
+        """
+        在前向计算前发起 KV Cache 加载（PD 分离模式）。
+
+        对应 vllm-ascend PR #950 中 model_runner 在执行前向推理前，将 Scheduler
+        构建的 ConnectorMetadata 绑定到 Worker 端连接器，并发起异步 KV 加载。
+
+        输入:
+            connector_metadata: ConnectorMetadata | None - Scheduler 传来的传输元数据，
+                None 表示非 PD 分离模式或本轮无需传输
+
+        执行逻辑:
+            # if not self.config.pd_disagg_enabled or connector_metadata is None:
+            #     return
+            # self.pd_connector.bind_connector_metadata(connector_metadata)
+            # self.pd_connector.start_load_kv()
+        """
+        pass
+
+    def maybe_wait_kv_save(self):
+        """
+        在前向计算后等待 KV Cache 保存完成（PD 分离模式）。
+
+        对应 vllm-ascend PR #950 中 model_runner 在前向推理完成后，等待
+        异步保存线程将 KV Cache 写入分布式存储。
+
+        执行逻辑:
+            # if not self.config.pd_disagg_enabled:
+            #     return
+            # if not self.pd_connector.has_connector_metadata():
+            #     return
+            # self.pd_connector.wait_for_save()
+        """
+        pass
+
+    def maybe_clear_connector_metadata(self):
+        """
+        清除已绑定的传输元数据（PD 分离模式，每步结束时调用）。
+
+        执行逻辑:
+            # if not self.config.pd_disagg_enabled:
+            #     return
+            # self.pd_connector.clear_connector_metadata()
+        """
+        pass
 
     @torch.inference_mode()
     def capture_cudagraph(self):
