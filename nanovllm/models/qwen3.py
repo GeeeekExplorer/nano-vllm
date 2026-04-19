@@ -208,7 +208,7 @@ class Qwen3ForCausalLM(nn.Module):
     ) -> torch.Tensor:
         return self.model(input_ids, positions)
 
-    def compute_logits(
+    def compute_logits( # 这作用是啥
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:

@@ -13,6 +13,7 @@ def main():
         "introduce yourself",
         "list all prime numbers within 100",
     ]
+    # todo: 这个是在外部进行tokenizer吗？
     prompts = [
         tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],

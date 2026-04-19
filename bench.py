@@ -2,9 +2,9 @@ import os
 import time
 from random import randint, seed
 from nanovllm import LLM, SamplingParams
-# from vllm import LLM, SamplingParams
-
-
+# from vllm import LLM, SamplingParams 
+# todo：⬆和vllm做对比
+# 压测吞吐
 def main():
     seed(0)
     num_seqs = 256
