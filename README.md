@@ -18,6 +18,36 @@ A lightweight vLLM implementation built from scratch.
 
 ## Installation
 
+### Option 1: Pip Installation
+
+Clone the repository and install dependencies using pip:
+
+```bash
+git clone https://github.com/BaoZhuhan/nano-vllm.git
+cd nano-vllm
+pip install -r requirements.txt
+```
+
+### Option 2: Conda Environment
+
+Create a conda environment with all dependencies:
+
+```bash
+conda env create -f environment.yml
+conda activate nano-vllm
+```
+
+### Option 3: Docker
+
+Build and run using Docker (requires NVIDIA GPU support):
+
+```bash
+docker build -t nano-vllm .
+docker run --gpus all -v /path/to/models:/app/models nano-vllm
+```
+
+For manual installation from source:
+
 ```bash
 pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
 ```

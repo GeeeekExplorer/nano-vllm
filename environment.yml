@@ -1,0 +1,17 @@
+name: nano-vllm
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pytorch>=2.4.0
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+  - pip
+  - pip:
+    - triton>=3.0.0
+    - transformers>=4.51.0
+    - flash-attn
+    - xxhash
