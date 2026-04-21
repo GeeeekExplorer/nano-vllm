@@ -12,6 +12,7 @@ class Block:
         self.ref_count = 0
         self.hash = -1
         self.token_ids = []
+        self.cache_ready = False
 
     def update(self, hash: int, token_ids: list[int]):
         self.hash = hash
@@ -21,6 +22,7 @@ class Block:
         self.ref_count = 1
         self.hash = -1
         self.token_ids = []
+        self.cache_ready = False
 
 
 class BlockManager:
@@ -64,7 +66,8 @@ class BlockManager:
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1
             block_id = self.hash_to_block_id.get(h, -1)
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+            block = self.blocks[block_id] if block_id != -1 else None
+            if (block_id == -1 or block.token_ids != token_ids or not block.cache_ready):
                 cache_miss = True
             if cache_miss:
                 block_id = self.free_block_ids[0]
@@ -107,6 +110,12 @@ class BlockManager:
             prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
             h = self.compute_hash(token_ids, prefix)
             last_block.update(h, token_ids)
+            last_block.cache_ready = True
             self.hash_to_block_id[h] = last_block.block_id
         else:
             assert last_block.hash == -1
+
+    def mark_blocks_ready(self, seq: Sequence, num_ready_tokens: int):
+        num_ready_blocks = num_ready_tokens // self.block_size
+        for i in range(num_ready_blocks):
+            self.blocks[seq.block_table[i]].cache_ready = True
