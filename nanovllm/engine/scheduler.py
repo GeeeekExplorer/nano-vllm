@@ -28,14 +28,23 @@ class Scheduler:
         # prefill
         while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.waiting[0]
+            
+            # Move allocate logic forward to ensure the state (seq.num_cached_tokens) 
+            # from prefix cache hits is correctly updated
+            if not seq.block_table:
+                if not self.block_manager.can_allocate(seq):
+                    break    # no budget
+                self.block_manager.allocate(seq)
+            
+            # Calculate the actual num_tokens using the updated seq.num_cached_tokens
             num_tokens = max(seq.num_tokens - seq.num_cached_tokens, 1)
             remaining = self.max_num_batched_tokens - num_batched_tokens
-            if remaining == 0 or (not seq.block_table and not self.block_manager.can_allocate(seq)):    # no budget
+            
+            if remaining == 0:    # no budget
                 break
             if remaining < num_tokens and scheduled_seqs:    # only allow chunked prefill for the first seq
                 break
-            if not seq.block_table:
-                self.block_manager.allocate(seq)
+                
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             if seq.num_scheduled_tokens == num_tokens:
                 seq.status = SequenceStatus.RUNNING
