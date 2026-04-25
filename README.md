@@ -43,6 +43,24 @@ outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
 
+## Profiling
+
+Enable PyTorch profiler to trace per-process performance when using tensor parallelism:
+
+```python
+llm = LLM(
+    "/YOUR/MODEL/PATH",
+    enable_profiling=True,
+    profiling_output_dir="./profiler_logs",
+)
+
+# Run inference...
+# Then view traces with TensorBoard:
+# tensorboard --logdir=./profiler_logs
+```
+
+The profiler traces are saved per rank (e.g., `rank0`, `rank1`) and can be analyzed using https://ui.perfetto.dev/ to identify performance bottlenecks in multi-process inference.
+
 ## Benchmark
 
 See `bench.py` for benchmark.
