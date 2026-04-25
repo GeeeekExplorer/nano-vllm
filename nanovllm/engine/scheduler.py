@@ -28,14 +28,25 @@ class Scheduler:
         # prefill
         while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.waiting[0]
-            num_tokens = max(seq.num_tokens - seq.num_cached_tokens, 1)
             remaining = self.max_num_batched_tokens - num_batched_tokens
-            if remaining == 0 or (not seq.block_table and not self.block_manager.can_allocate(seq)):    # no budget
+            if remaining == 0 or (not seq.block_table and not self.block_manager.can_allocate(seq)):
                 break
-            if remaining < num_tokens and scheduled_seqs:    # only allow chunked prefill for the first seq
-                break
+
             if not seq.block_table:
                 self.block_manager.allocate(seq)
+
+            # Re-calculate num_tokens after allocate(), as prefix caching may update 
+            # seq.num_cached_tokens during the allocation process.
+            #
+            # Using an outdated num_cached_tokens would overestimate num_scheduled_tokens, 
+            # leading to an inflated 'end' and 'end_block' in prepare_prefill (model_runner.py). 
+            # This results in an 'index out of range' at line 155 when accessing 
+            # seq.block_table[i] beyond its actual physical allocation.
+            num_tokens = max(seq.num_tokens - seq.num_cached_tokens, 1)
+
+            if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
+                break
+
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             if seq.num_scheduled_tokens == num_tokens:
                 seq.status = SequenceStatus.RUNNING
@@ -43,6 +54,7 @@ class Scheduler:
                 self.running.append(seq)
             scheduled_seqs.append(seq)
             num_batched_tokens += seq.num_scheduled_tokens
+
         if scheduled_seqs:
             return scheduled_seqs, True
 
