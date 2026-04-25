@@ -232,7 +232,11 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        # Always include max_bs and never exceed it: otherwise a decode batch
+        # whose size falls in the gap between the largest captured bucket and
+        # max_bs would raise StopIteration in run_model. Triggers whenever
+        # max_num_seqs is not a multiple of 16 (or smaller than 16), e.g. 12 or 100.
+        self.graph_bs = sorted({b for b in (1, 2, 4, 8) if b <= max_bs} | set(range(16, max_bs + 1, 16)) | {max_bs})
         self.graphs = {}
         self.graph_pool = None
 
