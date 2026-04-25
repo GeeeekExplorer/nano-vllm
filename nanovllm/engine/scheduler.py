@@ -84,7 +84,7 @@ class Scheduler:
         for seq, token_id in zip(seqs, token_ids):
             if is_prefill:
                 seq.num_cached_tokens = min(seq.num_cached_tokens + seq.num_scheduled_tokens, seq.num_tokens)
-                if seq.num_cached_tokens < seq.num_tokens or seq.num_completion_tokens > 0:    # chunked prefill or re prefill after preemption
+                if seq.num_cached_tokens < seq.num_tokens:    # chunked prefill
                     seq.num_scheduled_tokens = 0
                     continue
             seq.append_token(token_id)
