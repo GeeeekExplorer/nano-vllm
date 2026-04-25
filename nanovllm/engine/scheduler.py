@@ -36,6 +36,7 @@ class Scheduler:
                 break
             if not seq.block_table:
                 self.block_manager.allocate(seq)
+            num_tokens = max(seq.num_tokens - seq.num_cached_tokens, 1)
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             if seq.num_scheduled_tokens == num_tokens:
                 seq.status = SequenceStatus.RUNNING
