@@ -23,7 +23,7 @@ class Qwen3Attention(nn.Module):
         rms_norm_eps: float = 1e-06,
         qkv_bias: bool = False,
         rope_theta: float = 10000,
-        rope_scaling: dict | None = None,
+        rope_type: str = "default",
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -51,13 +51,12 @@ class Qwen3Attention(nn.Module):
             hidden_size,
             bias=False,
         )
-        if isinstance(rope_scaling, dict):
-            rope_theta = rope_scaling.get("rope_theta", rope_theta)
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=max_position,
             base=rope_theta,
+            type=rope_type,
         )
         self.attn = Attention(
             self.num_heads,
@@ -124,6 +123,7 @@ class Qwen3DecoderLayer(nn.Module):
         config: Qwen3Config,
     ) -> None:
         super().__init__()
+        rope_parameters = getattr(config, "rope_parameters", None) or {}
         self.self_attn = Qwen3Attention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
@@ -132,8 +132,8 @@ class Qwen3DecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             qkv_bias=getattr(config, 'attention_bias', True),
             head_dim=getattr(config, 'head_dim', None),
-            rope_theta=getattr(config, "rope_theta", 1000000),
-            rope_scaling=getattr(config, "rope_scaling", None),
+            rope_theta=rope_parameters.get("rope_theta", 1000000),
+            rope_type=rope_parameters.get("rope_type", "default"),
         )
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,
