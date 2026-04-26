@@ -52,6 +52,8 @@ class BlockManager:
 
     def _deallocate_block(self, block_id: int):
         assert self.blocks[block_id].ref_count == 0
+        if self.blocks[block_id].hash != -1:
+            self.hash_to_block_id.pop(self.blocks[block_id].hash, None)        
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
