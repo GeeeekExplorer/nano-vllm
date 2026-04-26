@@ -111,6 +111,12 @@ class ModelRunner:
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        if self.world_size > 1:
+            # Under TP all ranks must agree on the same block count so block IDs are
+            # consistent.  Take the minimum to avoid over-allocating on any rank.
+            t = torch.tensor(config.num_kvcache_blocks, dtype=torch.int64, device="cuda")
+            dist.all_reduce(t, op=dist.ReduceOp.MIN)
+            config.num_kvcache_blocks = int(t.item())
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
