@@ -1,6 +1,6 @@
 from collections import deque
 import xxhash
-import numpy as np
+import array
 
 from nanovllm.engine.sequence import Sequence
 
@@ -37,7 +37,7 @@ class BlockManager:
         h = xxhash.xxh64()
         if prefix != -1:
             h.update(prefix.to_bytes(8, "little"))
-        h.update(np.array(token_ids).tobytes())
+        h.update(array.array('i', token_ids).tobytes())
         return h.intdigest()
 
     def _allocate_block(self, block_id: int) -> Block:
