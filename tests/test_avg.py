@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from nanovllm.avg import (
     AVGDirector,
     AVGGenerationParams,
+    AVGGenerationResult,
     AstroInfluence,
     PlayerEvent,
     PlotPoint,
@@ -114,3 +115,66 @@ def test_generate_uses_existing_llm_generate_contract():
     assert "旁白" in text
     assert director.llm.calls[0][1].max_tokens == 32
     assert director.llm.calls[0][1].temperature == 0.6
+
+
+def test_generate_with_plan_returns_debuggable_result():
+    director = make_director()
+    result = director.generate_with_plan([], params=AVGGenerationParams(max_tokens=32))
+
+    assert isinstance(result, AVGGenerationResult)
+    assert "旁白" in result.text
+    assert result.plot_point.id == "calm_scene"
+    assert "剧情节点" in result.prompt
+
+
+def test_astro_seed_is_applied_before_generation():
+    director = make_director()
+    astro = AstroInfluence(
+        timestamp=datetime.now(timezone.utc),
+        bias={},
+        seed=1234,
+    )
+
+    director.generate([], astro=astro)
+
+    try:
+        import torch
+    except ImportError:
+        return
+    assert torch.initial_seed() == 1234
+
+
+def test_mapping_payloads_keep_unknown_integration_fields():
+    director = AVGDirector(
+        llm=FakeLLM(),
+        plot_points=[
+            {
+                "id": "mapping_scene",
+                "kind": "scene",
+                "target": {"affection": 0.7, "galaxy_mood": "blue"},
+                "description": "用字典配置的剧情节点。",
+            }
+        ],
+    )
+    astro = {
+        "timestamp": "2026-04-30T12:00:00+08:00",
+        "bias": {"affection": 0.2, "orbital_phase": "rising"},
+        "weights": {"affection": 2.0, "unknown_weight": 7},
+        "extra_payload": {"raw": True},
+    }
+    result = director.generate_with_plan(
+        events=[
+            {
+                "action": "raw_choice",
+                "delta": {"trust": 0.1, "external_score": 99},
+                "source": "game_runtime",
+            }
+        ],
+        astro=astro,
+    )
+
+    assert result.state.values["affection"] == 0.7
+    assert result.state.values["trust"] == 0.6
+    assert result.astro.metadata["unknown_bias"] == {"orbital_phase": "rising"}
+    assert result.astro.metadata["unknown_weights"] == {"unknown_weight": 7}
+    assert result.astro.metadata["extra_fields"]["extra_payload"] == {"raw": True}

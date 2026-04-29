@@ -4,17 +4,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Mapping
 
-
-CORE_STATE_KEYS = (
-    "affection",
-    "trust",
-    "stress",
-    "reason",
-    "explore",
-    "danger",
-)
-
-PLOT_POINT_KINDS = ("scene", "route", "ending")
+from nanovllm.avg.adapters import merge_metadata, parse_datetime, split_known_state_values
+from nanovllm.avg.constants import CORE_STATE_KEYS, PLOT_POINT_KINDS
 
 
 def clamp01(value: float) -> float:
@@ -48,6 +39,21 @@ class PlayerEvent:
             raise ValueError("PlayerEvent.action must not be empty")
         for key in self.delta:
             validate_state_key(key)
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any]) -> "PlayerEvent":
+        delta, unknown_delta = split_known_state_values(payload.get("delta", {}))
+        metadata = merge_metadata(
+            payload,
+            {"action", "delta", "tag", "metadata"},
+            {"unknown_delta": unknown_delta},
+        )
+        return cls(
+            action=str(payload.get("action", "unknown_action")),
+            delta=delta,
+            tag=payload.get("tag"),
+            metadata=metadata,
+        )
 
 
 @dataclass(slots=True)
@@ -88,6 +94,23 @@ class AstroInfluence:
                 if float(value) < 0:
                     raise ValueError("AstroInfluence.weights values must be non-negative")
 
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any]) -> "AstroInfluence":
+        bias, unknown_bias = split_known_state_values(payload.get("bias", {}))
+        weights, unknown_weights = split_known_state_values(payload.get("weights", {}))
+        metadata = merge_metadata(
+            payload,
+            {"timestamp", "bias", "weights", "seed", "metadata"},
+            {"unknown_bias": unknown_bias, "unknown_weights": unknown_weights},
+        )
+        return cls(
+            timestamp=parse_datetime(payload["timestamp"]),
+            bias=bias,
+            weights=weights or None,
+            seed=payload.get("seed"),
+            metadata=metadata,
+        )
+
 
 @dataclass(slots=True)
 class PlotPoint:
@@ -107,6 +130,22 @@ class PlotPoint:
             raise ValueError("PlotPoint.description must not be empty")
         self.target = normalize_state_values(self.target)
 
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any]) -> "PlotPoint":
+        target, unknown_target = split_known_state_values(payload.get("target", {}))
+        metadata = merge_metadata(
+            payload,
+            {"id", "kind", "target", "description", "metadata"},
+            {"unknown_target": unknown_target},
+        )
+        return cls(
+            id=str(payload["id"]),
+            kind=str(payload.get("kind", "scene")),
+            target=target,
+            description=str(payload["description"]),
+            metadata=metadata,
+        )
+
 
 @dataclass(slots=True)
 class AVGGenerationParams:
@@ -125,6 +164,15 @@ class AVGGenerationParams:
 
 @dataclass(slots=True)
 class AVGGenerationPlan:
+    state: AVGState
+    plot_point: PlotPoint
+    prompt: str
+    astro: AstroInfluence | None = None
+
+
+@dataclass(slots=True)
+class AVGGenerationResult:
+    text: str
     state: AVGState
     plot_point: PlotPoint
     prompt: str
