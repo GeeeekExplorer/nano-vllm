@@ -14,7 +14,7 @@ from nanovllm.engine.model_runner import ModelRunner
 
 class LLMEngine:
 
-    def __init__(self, model, **kwargs):
+    def __init__(self, model, enable_profiling: bool = False, profiling_output_dir: str = "./profiler_logs", **kwargs):
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
@@ -24,11 +24,11 @@ class LLMEngine:
         ctx = mp.get_context("spawn")
         for i in range(1, config.tensor_parallel_size):
             event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
+            process = ctx.Process(target=ModelRunner, args=(config, i, event, enable_profiling, profiling_output_dir))
             process.start()
             self.ps.append(process)
             self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
+        self.model_runner = ModelRunner(config, 0, self.events, enable_profiling, profiling_output_dir)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
