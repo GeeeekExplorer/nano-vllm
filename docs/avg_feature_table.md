@@ -120,6 +120,15 @@
 
 `AstroInfluence` 是星体模块和 AVG 模块之间的稳定数据契约。AVG 模块接收现实时间戳、状态偏置、权重、seed 和 metadata，但不计算星体位置，也不解释天文含义。
 
+为了方便和外部系统对接，AVG 接口支持两种输入形式：
+
+- 标准对象：`PlayerEvent`、`AstroInfluence`、`PlotPoint`
+- 原始字典：来自 JSON、游戏运行时或外部星体模块的普通 mapping payload
+
+已知字段会被标准化为 AVG 核心状态，未知字段会进入 `metadata`，用于联调、日志和后续扩展。这样可以先完成系统对接，再逐步收紧字段规范。
+
+核心状态字段由 `CORE_STATE_KEYS` 导出，剧情节点类型由 `PLOT_POINT_KINDS` 导出，外部模块可以直接引用这两个常量生成配置或做字段校验。
+
 ```python
 AstroInfluence(
     timestamp=timestamp,
@@ -134,4 +143,7 @@ AstroInfluence(
 
 - v1 重点是稳定接口、剧情收敛和可展示的本地模型生成流程。
 - 星体影响默认是隐性的，只改变剧情倾向、氛围和节点选择，不要求模型直接写出星体机制。
+- 外部输入支持宽松字典格式，未知字段会保留在 metadata 中，不阻断生成流程。
+- `seed` 会在生成前设置 PyTorch 随机种子，用于让同一星体影响输入下的采样更容易复现。
+- `generate_with_plan()` 会返回文本、最终状态、剧情节点和 prompt，方便游戏侧调试和接入。
 - `banned_words` 和 `required_words` 已进入生成参数，第一版通过 prompt 约束生效，后续可升级为 token 级硬约束。
