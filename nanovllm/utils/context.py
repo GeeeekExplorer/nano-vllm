@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import torch
 
 
-@dataclass
+@dataclass(slots=True)
 class Context:
     is_prefill: bool = False
     cu_seqlens_q: torch.Tensor | None = None
