@@ -8,10 +8,14 @@ class RMSNorm(nn.Module):
         self,
         hidden_size: int,
         eps: float = 1e-6,
+        has_weight: bool = True,
     ) -> None:
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(hidden_size))
+        if has_weight:
+            self.weight = nn.Parameter(torch.ones(hidden_size))
+        else:
+            self.register_parameter("weight", None)
 
     @torch.compile
     def rms_forward(
@@ -22,7 +26,9 @@ class RMSNorm(nn.Module):
         x = x.float()
         var = x.pow(2).mean(dim=-1, keepdim=True)
         x.mul_(torch.rsqrt(var + self.eps))
-        x = x.to(orig_dtype).mul_(self.weight)
+        x = x.to(orig_dtype)
+        if self.weight is not None:
+            x = x.mul_(self.weight)
         return x
 
     @torch.compile
@@ -36,7 +42,9 @@ class RMSNorm(nn.Module):
         residual = x.to(orig_dtype)
         var = x.pow(2).mean(dim=-1, keepdim=True)
         x.mul_(torch.rsqrt(var + self.eps))
-        x = x.to(orig_dtype).mul_(self.weight)
+        x = x.to(orig_dtype)
+        if self.weight is not None:
+            x = x.mul_(self.weight)
         return x, residual
 
     def forward(

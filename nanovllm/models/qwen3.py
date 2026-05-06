@@ -140,8 +140,9 @@ class Qwen3DecoderLayer(nn.Module):
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        rms_norm_has_weight = getattr(config, "rms_norm_has_weight", True)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, has_weight=rms_norm_has_weight)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, has_weight=rms_norm_has_weight)
 
     def forward(
         self,
