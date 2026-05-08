@@ -1,4 +1,5 @@
 import os
+import torch
 from dataclasses import dataclass
 from transformers import AutoConfig
 
@@ -16,6 +17,10 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    kv_quant: bool = True
+    kvcache_quant_dtype = torch.int8
+    kvscale_dtype = torch.bfloat16
+    group_num: int = 2
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -23,3 +28,4 @@ class Config:
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
+        assert self.max_num_batched_tokens >= self.max_model_len

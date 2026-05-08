@@ -3,13 +3,13 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "nano-vllm"
+name = "nano-vllm-kv-compression"
 version = "0.2.0"
-authors = [{ name = "Xingkai Yu" }]
+authors = [{ name = "Mingsong Jiang" }]
 license = "MIT"
 license-files = ["LICENSE"]
 readme = "README.md"
-description = "a lightweight vLLM implementation built from scratch"
+description = "An improved implementation based on Nano-vLLM featuring int8 KV cache compression, head-major memory layout for coalesced access, and asynchronous stream pipelining that hides KV store latency behind attention computation."
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "torch>=2.4.0",
@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage="https://github.com/GeeeekExplorer/nano-vllm"
+Homepage="https://github.com/naalo2/nano-vLLM-kv-compression"
 
 [tool.setuptools.packages.find]
 where = ["."]
