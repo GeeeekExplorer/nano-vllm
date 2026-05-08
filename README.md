@@ -22,6 +22,20 @@ A lightweight vLLM implementation built from scratch.
 pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
 ```
 
+### Install with uv (editable mode)
+
+Use `install_by_uv.sh` to set up a `uv` virtual environment and install nano-vllm in editable mode. After installation, source code edits take effect immediately when running `python example.py` — no reinstall needed.
+
+```bash
+bash install_by_uv.sh
+source .venv/bin/activate
+```
+
+The script will:
+- Install `uv` if it's missing
+- Create a `.venv` virtual environment if one doesn't exist
+- Install dependencies from `requirements.txt` (if present) and `pyproject.toml` (`uv pip install -e .`)
+
 ## Model Download
 
 To download the model weights manually, use the following command:
