@@ -22,6 +22,16 @@ A lightweight vLLM implementation built from scratch.
 pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
 ```
 
+## Attention Backend
+
+Nano-vLLM selects the attention backend automatically: it uses FlashAttention
+when `flash-attn` is available, otherwise it falls back to PyTorch SDPA. You can
+force a backend with the `NANOVLLM_ATTENTION_BACKEND` environment variable:
+
+```bash
+NANOVLLM_ATTENTION_BACKEND=sdpa python example.py
+```
+
 ## Model Download
 
 To download the model weights manually, use the following command:
