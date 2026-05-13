@@ -15,6 +15,7 @@ A lightweight vLLM implementation built from scratch.
 * 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
 * 📖 **Readable codebase** - Clean implementation in ~ 1,200 lines of Python code
 * ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Torch compilation, CUDA graph, etc.
+* 🖼️ **Multimodal support** - Qwen3.5 text + vision with CUDA graph decode
 
 ## Installation
 
@@ -24,10 +25,17 @@ pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
 
 ## Model Download
 
-To download the model weights manually, use the following command:
+### Qwen3 (text-only)
 ```bash
 huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
   --local-dir ~/huggingface/Qwen3-0.6B/ \
+  --local-dir-use-symlinks False
+```
+
+### Qwen3.5 (multimodal)
+```bash
+huggingface-cli download --resume-download Qwen/Qwen3.5-0.8B \
+  --local-dir ~/huggingface/Qwen3.5-0.8B/ \
   --local-dir-use-symlinks False
 ```
 
@@ -43,9 +51,47 @@ outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
 
+## Qwen3.5 Quick Start
+
+`example_qwen3_5.py` demonstrates both text-only and multimodal (image+text) inference. CUDA graph decode is enabled by default for maximum throughput.
+
+### Text-only batch
+```bash
+python example_qwen3_5.py --mode text --model ~/huggingface/Qwen3.5-0.8B/
+```
+
+### Multimodal (image + text)
+```bash
+python example_qwen3_5.py --mode multimodal --model ~/huggingface/Qwen3.5-0.8B/
+```
+
+### Python API
+```python
+from nanovllm import LLM, SamplingParams
+from transformers import AutoProcessor
+
+llm = LLM(
+    "~/huggingface/Qwen3.5-0.8B/",
+    is_multimodal=True,
+    enforce_eager=False,  # CUDA graph decode by default
+)
+processor = AutoProcessor.from_pretrained("~/huggingface/Qwen3.5-0.8B/")
+
+# Text-only
+outputs = llm.generate([prompt_text], SamplingParams(temperature=0.6, max_tokens=256))
+
+# Multimodal
+requests = [{"text": chat_prompt, "images": [image]}]
+outputs = llm.generate_multimodal(
+    requests,
+    [SamplingParams(temperature=0.6, max_tokens=256)],
+    processor,
+)
+```
+
 ## Benchmark
 
-See `bench.py` for benchmark.
+See `bench.py` for Qwen3 benchmark and `bench_qwen3_5.py` for Qwen3.5 benchmark.
 
 **Test Configuration:**
 - Hardware: RTX 4070 Laptop (8GB)
@@ -54,12 +100,33 @@ See `bench.py` for benchmark.
 - Input Length: Randomly sampled between 100–1024 tokens
 - Output Length: Randomly sampled between 100–1024 tokens
 
-**Performance Results:**
+**Qwen3 Performance Results:**
 | Inference Engine | Output Tokens | Time (s) | Throughput (tokens/s) |
 |----------------|-------------|----------|-----------------------|
 | vLLM           | 133,966     | 98.37    | 1361.84               |
 | Nano-vLLM      | 133,966     | 93.41    | 1434.13               |
 
+**Qwen3.5 Benchmark Commands:**
+```bash
+# Text-only throughput (same setup as Qwen3 benchmark)
+python bench_qwen3_5.py --mode text --num-seqs 256 --temperature 0.6 --ignore-eos --seed 0 --model ~/huggingface/Qwen3.5-0.8B/
+
+# Multimodal throughput
+python bench_qwen3_5.py --mode multimodal --num-images 10 --model ~/huggingface/Qwen3.5-0.8B/
+```
+
+**Test Configuration:**
+- Hardware: HGX H20 (96GB)
+- Model: Qwen3.5-0.8B
+- Text: 256 sequences, input 100–1024 tokens, output 100–1024 tokens, temperature=0.6, ignore_eos=True
+- Multimodal: 10 COCO images, max_new_tokens=2048, temperature=0.6
+
+**Qwen3.5 Performance Results (Nano-vLLM only):**
+
+| Mode | Requests | Prompt Tokens | Generated Tokens | Time (s) | Throughput (tokens/s) |
+|------|----------|---------------|------------------|----------|-----------------------|
+| Text (CUDA graph) | 256 | 142,827 | 133,966 | 25.09 | 5,338.40 |
+| Multimodal (CUDA graph) | 10 | 2,998 | 5,034 | 9.15 | 550.08 |
 
 ## Star History
 
