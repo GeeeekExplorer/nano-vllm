@@ -25,12 +25,13 @@ class Block:
 
 class BlockManager:
 
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(self, num_blocks: int, block_size: int, non_cache_token_ids: set[int] | None = None):
         self.block_size = block_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
+        self.non_cache_token_ids = non_cache_token_ids or set()
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -40,8 +41,11 @@ class BlockManager:
         h.update(np.array(token_ids).tobytes())
         return h.intdigest()
 
-    def _allocate_block(self) -> int:
-        block_id = self.free_block_ids.popleft()
+    def _allocate_block(self, block_id: int | None = None) -> int:
+        if block_id is None:
+            block_id = self.free_block_ids.popleft()
+        else:
+            self.free_block_ids.remove(block_id)
         block = self.blocks[block_id]
         assert block.ref_count == 0
         if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
@@ -55,11 +59,21 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
+    def _block_has_non_cache_tokens(self, seq: Sequence, block_idx: int) -> bool:
+        """Check if a block contains any non-cacheable tokens (e.g. vision tokens)."""
+        if not self.non_cache_token_ids:
+            return False
+        token_ids = seq.block(block_idx)
+        return bool(self.non_cache_token_ids.intersection(token_ids))
+
     def can_allocate(self, seq: Sequence) -> int:
         h = -1
         num_cached_blocks = 0
         num_new_blocks = seq.num_blocks
         for i in range(seq.num_blocks - 1):
+            # Skip caching for blocks with non-cacheable tokens
+            if self._block_has_non_cache_tokens(seq, i):
+                break
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
             block_id = self.hash_to_block_id.get(h, -1)
@@ -113,6 +127,10 @@ class BlockManager:
         if start == end: return
         h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
         for i in range(start, end):
+            # Skip caching for blocks with non-cacheable tokens
+            if self._block_has_non_cache_tokens(seq, i):
+                h = -1
+                continue
             block = self.blocks[seq.block_table[i]]
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)

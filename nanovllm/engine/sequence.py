@@ -2,6 +2,8 @@ from copy import copy
 from enum import Enum, auto
 from itertools import count
 
+import torch
+
 from nanovllm.sampling_params import SamplingParams
 
 
@@ -15,7 +17,9 @@ class Sequence:
     block_size = 256
     counter = count()
 
-    def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
+    def __init__(self, token_ids: list[int], sampling_params = SamplingParams(),
+                 images=None, pixel_values=None, image_grid_thw=None,
+                 vision_counts=None, vision_placeholders=None):
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
@@ -29,6 +33,16 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+
+        # Multimodal fields
+        self.images = images
+        self.pixel_values = pixel_values
+        self.image_grid_thw = image_grid_thw
+        self.vision_placeholders = vision_placeholders or []
+        self.vision_counts = vision_counts or []
+        self.vision_consumed = [0] * len(self.vision_placeholders)
+        self.cached_vision_tokens = None
+        self.vision_offset = 0
 
     def __len__(self):
         return self.num_tokens
@@ -55,6 +69,10 @@ class Sequence:
     @property
     def num_blocks(self):
         return (self.num_tokens + self.block_size - 1) // self.block_size
+
+    @property
+    def num_cached_blocks(self):
+        return self.num_cached_tokens // self.block_size
 
     @property
     def last_block_num_tokens(self):
