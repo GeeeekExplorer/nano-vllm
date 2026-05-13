@@ -503,6 +503,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             ),
             persistent=False,
         )
+        # Pool buffer for conv state: indexed by slot, avoids per-seq gather/scatter
+        self.register_buffer(
+            "_pool_conv_state",
+            torch.zeros(
+                max_graph_bs,
+                conv_dim_tp,
+                self.conv_kernel_size - 1,
+                dtype=torch.bfloat16,
+            ),
+            persistent=False,
+        )
+        # Persistent ssm_state_indices: updated in-place before CUDA graph replay
+        self.register_buffer(
+            "_graph_ssm_state_indices",
+            torch.arange(max_graph_bs, dtype=torch.int64),
+            persistent=False,
+        )
 
     def reset_state(self):
         """Reset all cached states. Called after warmup to avoid state pollution."""
@@ -512,6 +529,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self._decode_step_counter.clear()
         self._graph_conv_state.zero_()
         self._graph_recurrent_state.zero_()
+        self._pool_conv_state.zero_()
+        self._graph_ssm_state_indices.copy_(torch.arange(self._graph_ssm_state_indices.shape[0], dtype=torch.int64, device=self._graph_ssm_state_indices.device))
 
     def _get_states(self, sequence_id: int | None):
         """Get conv_state and recurrent_state for this sequence."""
@@ -647,9 +666,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
         if use_triton:
-            # ssm_state_indices avoids Triton None compilation issue during graph capture.
-            # Each batch element i maps to state slot i in the graph buffer.
-            ssm_state_indices = torch.arange(bs, dtype=torch.int64, device=hidden_states.device)
+            # Persistent indices buffer — model_runner updates this in-place before replay
+            # so CUDA graph reads correct pool slot mappings for each sequence.
+            ssm_state_indices = self._graph_ssm_state_indices[:bs]
             core_attn_out_batch, _ = fla_fused_recurrent_gated_delta_rule(
                 q=q_batch,
                 k=k_batch,
@@ -2271,4 +2290,5 @@ def load_qwen3_5_model(model_path, config):
     from nanovllm.utils.loader import load_model
     print("[load_qwen3_5_model] Loading Qwen3.5 multimodal weights...")
     load_model(model, model_path, name_mapping=_qwen_multimodal_name_mapping)
+    print("[load_qwen3_5_model] Model ready.")
     return model

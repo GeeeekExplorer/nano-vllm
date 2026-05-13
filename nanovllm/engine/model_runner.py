@@ -37,6 +37,28 @@ if not MULTIMODAL_AVAILABLE:
     print("[ModelRunner] 多模态模块不可用")
 
 
+class GDNSlotManager:
+    """Manages slot allocation for GDN state pool buffers."""
+
+    def __init__(self, max_slots: int):
+        self.max_slots = max_slots
+        self._seq_to_slot: dict[int, int] = {}
+        self._free_slots: list[int] = list(range(max_slots - 1, -1, -1))
+
+    def allocate(self, seq_id: int) -> int:
+        slot = self._free_slots.pop()
+        self._seq_to_slot[seq_id] = slot
+        return slot
+
+    def get_slot(self, seq_id: int) -> int | None:
+        return self._seq_to_slot.get(seq_id)
+
+    def release(self, seq_id: int):
+        slot = self._seq_to_slot.pop(seq_id, None)
+        if slot is not None:
+            self._free_slots.append(slot)
+
+
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
@@ -125,12 +147,18 @@ class ModelRunner:
         # eager decode for Qwen3.5 anymore.
 
         self.sampler = Sampler()
-        self.warmup_model()
-        # Reset GatedDeltaNet states after warmup to avoid polluting real sequences
+        # Initialize GDN layer references before warmup (run_model checks self._gdn_layers)
+        self._gdn_layers = []
         if hasattr(self.model, 'language_model') and hasattr(self.model.language_model, 'model'):
             for layer in self.model.language_model.model.layers:
                 if hasattr(layer, 'linear_attn') and layer.linear_attn is not None:
-                    layer.linear_attn.reset_state()
+                    self._gdn_layers.append(layer.linear_attn)
+        self._gdn_slot_manager = GDNSlotManager(max_slots=512)
+        self._gdn_slot_tensor = torch.zeros(512, dtype=torch.int64, device=self.device)
+        self.warmup_model()
+        # Reset GatedDeltaNet states after warmup to avoid polluting real sequences
+        for gdn in self._gdn_layers:
+            gdn.reset_state()
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
@@ -299,20 +327,20 @@ class ModelRunner:
                         layer.linear_attn.reset_state()
 
     def cleanup_seq_states(self, seq_ids: list[int]):
-        """Remove GDN state_cache entries for finished sequences."""
-        if hasattr(self.model, "language_model") and hasattr(
-            self.model.language_model, "model"
-        ):
-            for layer in self.model.language_model.model.layers:
-                if hasattr(layer, "linear_attn") and layer.linear_attn is not None:
-                    state_cache = getattr(layer.linear_attn, "state_cache", None)
-                    if state_cache is not None:
-                        for sid in seq_ids:
-                            state_cache.pop(sid, None)
-                    counter = getattr(layer.linear_attn, "_decode_step_counter", None)
-                    if counter is not None:
-                        for sid in seq_ids:
-                            counter.pop(sid, None)
+        """Release pool slots and clean residual state_cache for finished sequences."""
+        for sid in seq_ids:
+            slot = self._gdn_slot_manager.get_slot(sid)
+            if slot is not None:
+                for gdn in self._gdn_layers:
+                    gdn._pool_conv_state[slot].zero_()
+                    gdn._graph_recurrent_state[slot].zero_()
+                self._gdn_slot_manager.release(sid)
+        # Also clean residual state_cache entries (from prefill if not yet migrated)
+        for gdn in self._gdn_layers:
+            for sid in seq_ids:
+                gdn.state_cache.pop(sid, None)
+                if hasattr(gdn, '_decode_step_counter'):
+                    gdn._decode_step_counter.pop(sid, None)
 
     def allocate_kv_cache(self):
         config = self.config
@@ -449,41 +477,44 @@ class ModelRunner:
         return temperatures
 
     def _gather_gdn_states(self, sequence_ids: list[int], bs: int):
-        """Copy per-sequence states from state_cache into graph buffers before replay."""
-        if not hasattr(self.model, "language_model") or not hasattr(
-            self.model.language_model, "model"
-        ):
+        """Vectorized gather: assign pool slots and copy conv state into graph buffers."""
+        if not self._gdn_layers:
             return
-        for layer in self.model.language_model.model.layers:
-            if hasattr(layer, "linear_attn") and layer.linear_attn is not None:
-                gdn = layer.linear_attn
-                for i, seq_id in enumerate(sequence_ids):
-                    conv_state, recurrent_state = gdn.state_cache.get(seq_id, (None, None))
-                    if conv_state is not None:
-                        # conv_state eager shape: (1, conv_dim, kernel_size-1)
-                        gdn._graph_conv_state[i].copy_(conv_state.squeeze(0))
+        # Allocate slots for new sequences (first decode after prefill)
+        slots = []
+        for seq_id in sequence_ids:
+            slot = self._gdn_slot_manager.get_slot(seq_id)
+            if slot is None:
+                slot = self._gdn_slot_manager.allocate(seq_id)
+                # Migrate from state_cache (set during prefill) to pool
+                for gdn in self._gdn_layers:
+                    cached = gdn.state_cache.pop(seq_id, (None, None))
+                    if cached[0] is not None:
+                        gdn._pool_conv_state[slot].copy_(cached[0].squeeze(0))
                     else:
-                        gdn._graph_conv_state[i].zero_()
-                    if recurrent_state is not None:
-                        # recurrent_state eager shape: (1, H, V, K)
-                        gdn._graph_recurrent_state[i].copy_(recurrent_state.squeeze(0))
+                        gdn._pool_conv_state[slot].zero_()
+                    if cached[1] is not None:
+                        gdn._graph_recurrent_state[slot].copy_(cached[1].squeeze(0))
                     else:
-                        gdn._graph_recurrent_state[i].zero_()
+                        gdn._graph_recurrent_state[slot].zero_()
+            slots.append(slot)
+
+        # Build index tensor
+        self._gdn_slot_tensor[:bs].copy_(torch.tensor(slots, dtype=torch.int64, device=self.device))
+        idx = self._gdn_slot_tensor[:bs]
+
+        # Vectorized: gather conv state + set ssm_state_indices for each layer
+        for gdn in self._gdn_layers:
+            gdn._graph_conv_state[:bs] = gdn._pool_conv_state[idx]
+            gdn._graph_ssm_state_indices[:bs] = idx
 
     def _scatter_gdn_states(self, sequence_ids: list[int], bs: int):
-        """Copy updated graph buffers back into state_cache after replay."""
-        if not hasattr(self.model, "language_model") or not hasattr(
-            self.model.language_model, "model"
-        ):
+        """Scatter conv state back to pool. Recurrent state is written in-place by Triton."""
+        if not self._gdn_layers:
             return
-        for layer in self.model.language_model.model.layers:
-            if hasattr(layer, "linear_attn") and layer.linear_attn is not None:
-                gdn = layer.linear_attn
-                for i, seq_id in enumerate(sequence_ids):
-                    gdn.state_cache[seq_id] = (
-                        gdn._graph_conv_state[i : i + 1].clone(),
-                        gdn._graph_recurrent_state[i : i + 1].clone(),
-                    )
+        idx = self._gdn_slot_tensor[:bs]
+        for gdn in self._gdn_layers:
+            gdn._pool_conv_state[idx] = gdn._graph_conv_state[:bs]
 
     def _debug_prefill_logits(self, hidden_states: torch.Tensor, logits: torch.Tensor):
         """Print last-token hidden norm and logits top-5 when NANOVLLM_DEBUG_LOGITS=1."""
@@ -533,12 +564,11 @@ class ModelRunner:
                 if image_grid_thw_per_seq is not None:
                     model_kwargs["image_grid_thw_per_seq"] = image_grid_thw_per_seq
             elif (
-                Qwen3NextForCausalLM is not None
-                and isinstance(self.model, Qwen3NextForCausalLM)
+                self._gdn_layers
                 and sequence_lengths is not None
                 and len(sequence_lengths) > 1
             ):
-                # Pure text Qwen3.5/Qwen3-Next batch: GDN needs per-seq isolation
+                # Qwen3.5/GDN batch: GDN needs per-seq isolation
                 model_kwargs["sequence_lengths"] = sequence_lengths
                 if sequence_ids is not None:
                     model_kwargs["sequence_ids"] = sequence_ids
@@ -646,7 +676,7 @@ class ModelRunner:
                         non_blocking=True,
                     ).contiguous()
 
-                    # debug_mean = float(token_slice.float().abs().mean().item())
+                    debug_mean = float(token_slice.float().abs().mean().item())
                     # print(
                     #     "[ModelRunner] slice",
                     #     {
@@ -766,6 +796,11 @@ class ModelRunner:
             # Capture uses dummy tokens; ensure it doesn't leak recurrent states
             # into subsequent captures or real inference.
             self._reset_gdn_states()
+            # Ensure identity mapping for ssm_state_indices during capture
+            for gdn in self._gdn_layers:
+                gdn._graph_ssm_state_indices.copy_(
+                    torch.arange(gdn._graph_ssm_state_indices.shape[0], dtype=torch.int64, device=gdn._graph_ssm_state_indices.device)
+                )
             graph = torch.cuda.CUDAGraph()
             set_context(
                 False,
@@ -779,7 +814,7 @@ class ModelRunner:
             # will use the wrong recurrence semantics and can produce repeated
             # tokens / garbled outputs.
             extra_kwargs = {}
-            if Qwen3NextForCausalLM is not None and isinstance(self.model, Qwen3NextForCausalLM):
+            if self._gdn_layers:
                 extra_kwargs["sequence_lengths"] = [1] * bs
                 extra_kwargs["use_graph"] = True
             outputs[:bs] = self.model(

@@ -115,14 +115,18 @@ python bench_qwen3_5.py --mode text --num-seqs 256 --temperature 0.6 --ignore-eo
 python bench_qwen3_5.py --mode multimodal --num-images 10 --model ~/huggingface/Qwen3.5-0.8B/
 ```
 
+**Test Configuration:**
+- Hardware: HGX H20 (96GB)
+- Model: Qwen3.5-0.8B
+- Text: 256 sequences, input 100–1024 tokens, output 100–1024 tokens, temperature=0.6, ignore_eos=True
+- Multimodal: 10 COCO images, max_new_tokens=2048, temperature=0.6
+
 **Qwen3.5 Performance Results (Nano-vLLM only):**
 
 | Mode | Requests | Prompt Tokens | Generated Tokens | Time (s) | Throughput (tokens/s) |
 |------|----------|---------------|------------------|----------|-----------------------|
-| Text (CUDA graph) | 256 | 142,827 | 133,966 | 162.23 | 825.79 |
-| Multimodal (CUDA graph) | 10 | 2,998 | 5,114 | 11.18 | 457.38 |
-
-*Configuration: H20, Qwen3.5-0.8B, temperature=0.6, ignore_eos=True (text).*
+| Text (CUDA graph) | 256 | 142,827 | 133,966 | 25.09 | 5,338.40 |
+| Multimodal (CUDA graph) | 10 | 2,998 | 5,034 | 9.15 | 550.08 |
 
 ## Star History
 
