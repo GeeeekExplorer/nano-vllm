@@ -138,7 +138,7 @@ class ModelRunner:
         for seq in seqs:
             seqlen = len(seq)
             start = min(seq.num_cached_tokens, seqlen - 1)
-            seqlen_q = seq.num_scheduled_tokens
+            seqlen_q = min(seq.num_scheduled_tokens, seqlen - start)
             seqlen_k = seqlen
             end = start + seqlen_q
             input_ids.extend(seq[start:end])
