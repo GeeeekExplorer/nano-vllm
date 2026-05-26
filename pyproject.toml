@@ -12,7 +12,7 @@ readme = "README.md"
 description = "a lightweight vLLM implementation built from scratch"
 requires-python = ">=3.10,<3.13"
 dependencies = [
-    "torch>=2.4.0",
+    "torch==2.8.0",
     "triton>=3.0.0",
     "transformers>=4.51.0",
     "flash-attn",
@@ -25,3 +25,17 @@ Homepage="https://github.com/GeeeekExplorer/nano-vllm"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["nanovllm*"]
+
+[tool.uv]
+# flash-attn imports torch in setup.py, so it must build in the project env (not an isolated one)
+no-build-isolation-package = ["flash-attn"]
+
+# Force torch to resolve from PyTorch's cu126 index so we get a CUDA-12 wheel
+# (CUDA-13 wheels of torch don't have matching flash-attn precompiled wheels).
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
