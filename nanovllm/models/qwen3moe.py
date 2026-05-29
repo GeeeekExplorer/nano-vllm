@@ -14,8 +14,9 @@ from nanovllm.layers import (
     get_rope,
     VocabParallelEmbedding,
     ParallelLMHead,
+    shard_slice,
 )
-from nanovllm.kernels import grouped_moe_forward
+from nanovllm.kernels import fused_experts
 
 class Qwen3MoeAttention(nn.Module):
 
@@ -150,6 +151,48 @@ class Qwen3MoeTopKRouter(nn.Module):
         return routing_weights, selected_experts
 
 
+class Qwen3MoeExperts(nn.Module):
+    """所有 expert 的权重 stack 成 [E, ...]，配合可捕获的 fused grouped-GEMM。
+
+    TP 切分方式与逐 expert 的 MLP 一致：
+      - gate/up: 在 intermediate 维做 column-parallel（每个 rank 持有 I_local = I//tp）
+      - down:    在 intermediate 维做 row-parallel（输出需在外层 all_reduce）
+    权重布局：
+      - w13: [E, 2*I_local, H]  前 I_local 行是 gate，后 I_local 行是 up
+      - w2:  [E, H, I_local]
+    """
+
+    def __init__(self, num_experts: int, hidden_size: int, intermediate_size: int) -> None:
+        super().__init__()
+        tp = dist.get_world_size() if dist.is_initialized() else 1
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        assert intermediate_size % tp == 0
+        I_local = intermediate_size // tp
+        self.num_experts = num_experts
+        self.hidden_size = hidden_size
+        self.intermediate_size_per_partition = I_local
+        self.tp_rank = rank
+        self.w13 = nn.Parameter(torch.empty(num_experts, 2 * I_local, hidden_size))
+        self.w2 = nn.Parameter(torch.empty(num_experts, hidden_size, I_local))
+        self.w13.weight_loader = self.weight_loader
+        self.w2.weight_loader = self.weight_loader
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight, expert_id: int, shard_id: str):
+        I = self.intermediate_size_per_partition
+        r = self.tp_rank
+        if shard_id == "gate":
+            param.data[expert_id, 0:I, :].copy_(shard_slice(loaded_weight, 0, r * I, I))
+        elif shard_id == "up":
+            param.data[expert_id, I:2 * I, :].copy_(shard_slice(loaded_weight, 0, r * I, I))
+        elif shard_id == "down":
+            param.data[expert_id, :, :].copy_(shard_slice(loaded_weight, 1, r * I, I))
+        else:
+            raise ValueError(f"unknown expert shard_id: {shard_id}")
+
+    def forward(self, hidden_states, routing_weights, selected_experts):
+        return fused_experts(hidden_states, self.w13, self.w2, routing_weights, selected_experts)
+
+
 class Qwen3MoeSparseMoeBlock(nn.Module):
     def __init__(
         self, 
@@ -168,30 +211,19 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             num_experts_per_tok=self.num_experts_per_tok,
             norm_topk_prob=self.norm_topk_prob,
         )
-        # experts 直接挂在 sparse block 下（mlp.experts.N），与 HF checkpoint 命名一致，
-        # 这样通用 loader 不需要任何路径重写。
-        self.experts = nn.ModuleList(
-            [
-                Qwen3MoeMLP(
-                    hidden_size=self.hidden_size,
-                    intermediate_size=self.intermediate_dim,
-                    hidden_act=config.hidden_act,
-                )
-                for _ in range(self.num_experts)
-            ]
+        self.experts = Qwen3MoeExperts(
+            num_experts=self.num_experts,
+            hidden_size=self.hidden_size,
+            intermediate_size=self.intermediate_dim,
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
         routing_weights, selected_experts = self.gate(hidden_states)
-        out = grouped_moe_forward(
-            hidden_states=hidden_states,
-            routing_weights=routing_weights,
-            selected_experts=selected_experts,
-            experts=self.experts,
-            num_experts=self.num_experts,
-        )
+        out = self.experts(hidden_states, routing_weights, selected_experts)
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            dist.all_reduce(out)
         return out.view(orig_shape)
 
 
@@ -271,6 +303,13 @@ class Qwen3MoeForCausalLM(nn.Module):
         "v_proj": ("qkv_proj", "v"),
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
+    }
+    # MoE 专家权重单独处理：ckpt 里的 mlp.experts.{e}.{proj}.weight
+    # -> stacked 参数 mlp.experts.{stack_param}，并带上 expert_id 与 shard_id。
+    expert_modules_mapping = {
+        "gate_proj": ("w13", "gate"),
+        "up_proj": ("w13", "up"),
+        "down_proj": ("w2", "down"),
     }
 
     def __init__(

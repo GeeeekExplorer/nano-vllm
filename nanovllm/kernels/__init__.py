@@ -1,3 +1,3 @@
-from .moe import build_topk_dispatch, grouped_moe_forward
+from .moe import fused_experts, moe_align_block_size
 
-__all__ = ["build_topk_dispatch", "grouped_moe_forward"]
+__all__ = ["fused_experts", "moe_align_block_size"]
