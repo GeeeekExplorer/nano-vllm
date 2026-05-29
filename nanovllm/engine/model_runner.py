@@ -1,20 +1,24 @@
 import pickle
 import torch
+import torch._dynamo
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
-from nanovllm.layers.sampler import Sampler
+from nanovllm.layers import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+from nanovllm.models.model_registry import get_model_class
 
 
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+        # RMSNorm 等 @torch.compile 函数会因 输入维数(2D/3D)、默认设备切换、size=1 特化
+        # 触发有限次(一次性)重编译；默认阈值 8 偏小会刷 cache_size_limit 警告，调高即可。
+        torch._dynamo.config.cache_size_limit = 64
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
@@ -28,7 +32,8 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        model_cls = get_model_class(hf_config.model_type)
+        self.model = model_cls(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
@@ -107,7 +112,7 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        num_kv_heads = max(1, hf_config.num_key_value_heads // self.world_size)
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
@@ -140,7 +145,12 @@ class ModelRunner:
             seqlen_q = seq.num_scheduled_tokens
             end = start + seqlen_q
             seqlen_k = end
-            input_ids.extend(seq[start:end])
+            # decode seq 经 shm 传到 worker 时只带 last_token(token_ids 为空)，故按 is_prefill 取 token：
+            # prefill chunk 用 seq[start:end]，decode 用 last_token。
+            if seq.is_prefill:
+                input_ids.extend(seq[start:end])
+            else:
+                input_ids.append(seq.last_token)
             positions.extend(range(start, end))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)

@@ -1,4 +1,5 @@
 from collections import deque
+from time import perf_counter
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
@@ -23,15 +24,45 @@ class Scheduler:
         self.waiting.append(seq)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
+        """Chunked-prefill 混合连续批处理：一个 step 内同时调度 running 的 decode
+        (每个 1 token) 和 waiting 的 prefill chunk。
+
+        返回 (scheduled_seqs, has_prefill)。has_prefill 为 True 表示本批含 prefill chunk，
+        需走 eager 统一 varlen 路径；为 False 表示纯 decode，可走 CUDA Graph。
+        """
         scheduled_seqs = []
+        num_seqs = 0
         num_batched_tokens = 0
 
-        # prefill
-        while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
-            seq = self.waiting[0]
+        # ---- decode: 每个 running seq 推进 1 个 token（预算便宜，优先排）----
+        running = self.running
+        self.running = deque()
+        while running and num_seqs < self.max_num_seqs:
+            seq = running.popleft()
+            while not self.block_manager.can_append(seq):
+                if running:
+                    self.preempt(running.pop())
+                else:
+                    self.preempt(seq)
+                    break
+            else:
+                num_seqs += 1
+                self.block_manager.may_append(seq)
+                seq.num_scheduled_tokens = 1
+                seq.is_prefill = False
+                num_batched_tokens += 1
+                self.running.append(seq)
+                scheduled_seqs.append(seq)
+        # 受 max_num_seqs 限制本步没处理到的 running seq 留在队列里
+        self.running.extend(running)
+
+        # ---- prefill: 用剩余 token 预算给 waiting 的 seq 分块 ----
+        has_prefill = False
+        while self.waiting and num_seqs < self.max_num_seqs:
             remaining = self.max_num_batched_tokens - num_batched_tokens
-            if remaining == 0:
+            if remaining <= 0:
                 break
+            seq = self.waiting[0]
             if not seq.block_table:
                 num_cached_blocks = self.block_manager.can_allocate(seq)
                 if num_cached_blocks == -1:
@@ -39,38 +70,23 @@ class Scheduler:
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
             else:
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
-            if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
+            scheduled_tokens = min(num_tokens, remaining)
+            if scheduled_tokens <= 0:
                 break
             if not seq.block_table:
                 self.block_manager.allocate(seq, num_cached_blocks)
-            seq.num_scheduled_tokens = min(num_tokens, remaining)
-            num_batched_tokens += seq.num_scheduled_tokens
+            seq.num_scheduled_tokens = scheduled_tokens
+            num_batched_tokens += scheduled_tokens
+            num_seqs += 1
+            has_prefill = True
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
                 seq.status = SequenceStatus.RUNNING
                 self.waiting.popleft()
                 self.running.append(seq)
             scheduled_seqs.append(seq)
 
-        if scheduled_seqs:
-            return scheduled_seqs, True
-
-        # decode
-        while self.running and len(scheduled_seqs) < self.max_num_seqs:
-            seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
-                if self.running:
-                    self.preempt(self.running.pop())
-                else:
-                    self.preempt(seq)
-                    break
-            else:
-                seq.num_scheduled_tokens = 1
-                seq.is_prefill = False
-                self.block_manager.may_append(seq)
-                scheduled_seqs.append(seq)
         assert scheduled_seqs
-        self.running.extendleft(reversed(scheduled_seqs))
-        return scheduled_seqs, False
+        return scheduled_seqs, has_prefill
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
@@ -78,14 +94,18 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
+    def postprocess(self, seqs: list[Sequence], token_ids: list[int]):
         for seq, token_id in zip(seqs, token_ids):
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
+            # 逐 seq 判定：仍在 prefill 中(本块非最后一块)的 seq 不产出 token，继续留在 waiting
+            still_prefilling = seq.num_cached_tokens < seq.num_tokens
             seq.num_scheduled_tokens = 0
-            if is_prefill and seq.num_cached_tokens < seq.num_tokens:
+            if still_prefilling:
                 continue
             seq.append_token(token_id)
+            if seq.first_token_time is None:    # 首个 completion token 产出，记录 TTFT 时间点
+                seq.first_token_time = perf_counter()
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)

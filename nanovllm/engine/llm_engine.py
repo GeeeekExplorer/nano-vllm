@@ -32,6 +32,7 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self.last_ttft_stats = None
         atexit.register(self.exit)
 
     def exit(self):
@@ -44,13 +45,17 @@ class LLMEngine:
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
+        seq.arrival_time = perf_counter()
         self.scheduler.add(seq)
+        return seq
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
+        # 混合批 (is_prefill=True) 时 num_tokens 为本步处理的总 token 数(prefill chunk + decode)，
+        # 纯 decode 批为 -len(seqs)，用于 tqdm 区分 prefill / decode 吞吐显示。
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        self.scheduler.postprocess(seqs, token_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
 
@@ -66,8 +71,7 @@ class LLMEngine:
         pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
-        for prompt, sp in zip(prompts, sampling_params):
-            self.add_request(prompt, sp)
+        seqs = [self.add_request(prompt, sp) for prompt, sp in zip(prompts, sampling_params)]
         outputs = {}
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():
@@ -85,6 +89,22 @@ class LLMEngine:
                 outputs[seq_id] = token_ids
                 pbar.update(1)
         pbar.close()
+
+        ttfts = [seq.ttft for seq in seqs if seq.ttft is not None]
+        self.last_ttft_stats = None
+        if ttfts:
+            avg_ttft = sum(ttfts) / len(ttfts)
+            self.last_ttft_stats = {
+                "num_seqs": len(ttfts),
+                "avg": avg_ttft,
+                "min": min(ttfts),
+                "max": max(ttfts),
+            }
+            print(
+                f"[TTFT] seqs={len(ttfts)} avg={avg_ttft * 1000:.2f}ms "
+                f"min={min(ttfts) * 1000:.2f}ms max={max(ttfts) * 1000:.2f}ms"
+            )
+
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
         return outputs

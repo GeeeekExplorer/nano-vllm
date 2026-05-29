@@ -11,8 +11,8 @@ def main():
     max_input_len = 1024
     max_ouput_len = 1024
 
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
-    llm = LLM(path, enforce_eager=False, max_model_len=4096)
+    path = os.path.expanduser("./model/Qwen3-30B-A3B/")
+    llm = LLM(path, enforce_eager=False, max_model_len=4096, tensor_parallel_size=8, gpu_memory_utilization=0.8)
 
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
     sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(100, max_ouput_len)) for _ in range(num_seqs)]
@@ -25,7 +25,12 @@ def main():
     t = (time.time() - t)
     total_tokens = sum(sp.max_tokens for sp in sampling_params)
     throughput = total_tokens / t
-    print(f"Total: {total_tokens}tok, Time: {t:.2f}s, Throughput: {throughput:.2f}tok/s")
+    ttft = llm.last_ttft_stats
+    ttft_str = (
+        f", TTFT(avg/min/max): {ttft['avg'] * 1000:.2f}/{ttft['min'] * 1000:.2f}/{ttft['max'] * 1000:.2f}ms"
+        if ttft else ""
+    )
+    print(f"Total: {total_tokens}tok, Time: {t:.2f}s, Throughput: {throughput:.2f}tok/s{ttft_str}")
 
 
 if __name__ == "__main__":
