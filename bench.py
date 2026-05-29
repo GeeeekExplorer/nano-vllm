@@ -25,7 +25,12 @@ def main():
     t = (time.time() - t)
     total_tokens = sum(sp.max_tokens for sp in sampling_params)
     throughput = total_tokens / t
-    print(f"Total: {total_tokens}tok, Time: {t:.2f}s, Throughput: {throughput:.2f}tok/s")
+    ttft = llm.last_ttft_stats
+    ttft_str = (
+        f", TTFT(avg/min/max): {ttft['avg'] * 1000:.2f}/{ttft['min'] * 1000:.2f}/{ttft['max'] * 1000:.2f}ms"
+        if ttft else ""
+    )
+    print(f"Total: {total_tokens}tok, Time: {t:.2f}s, Throughput: {throughput:.2f}tok/s{ttft_str}")
 
 
 if __name__ == "__main__":

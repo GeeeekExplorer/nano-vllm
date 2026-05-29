@@ -29,6 +29,9 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        # TTFT 打点：到达时间 与 首 token 产出时间（均在主进程记录）
+        self.arrival_time: float | None = None
+        self.first_token_time: float | None = None
 
     def __len__(self):
         return self.num_tokens
@@ -43,6 +46,13 @@ class Sequence:
     @property
     def num_completion_tokens(self):
         return self.num_tokens - self.num_prompt_tokens
+
+    @property
+    def ttft(self) -> float | None:
+        """Time To First Token：首 token 时间 - 到达时间。未产出首 token 时为 None。"""
+        if self.arrival_time is None or self.first_token_time is None:
+            return None
+        return self.first_token_time - self.arrival_time
 
     @property
     def prompt_token_ids(self):

@@ -1,5 +1,6 @@
 import pickle
 import torch
+import torch._dynamo
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
@@ -15,6 +16,9 @@ from nanovllm.models.model_registry import get_model_class
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+        # RMSNorm 等 @torch.compile 函数会因 输入维数(2D/3D)、默认设备切换、size=1 特化
+        # 触发有限次(一次性)重编译；默认阈值 8 偏小会刷 cache_size_limit 警告，调高即可。
+        torch._dynamo.config.cache_size_limit = 64
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size

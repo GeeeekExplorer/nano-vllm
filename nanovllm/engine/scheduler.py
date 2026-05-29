@@ -1,4 +1,5 @@
 from collections import deque
+from time import perf_counter
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
@@ -86,6 +87,8 @@ class Scheduler:
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:
                 continue
             seq.append_token(token_id)
+            if seq.first_token_time is None:    # 首个 completion token 产出，记录 TTFT 时间点
+                seq.first_token_time = perf_counter()
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
