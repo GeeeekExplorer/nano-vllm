@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 from nanovllm.utils.context import get_context
+from nanovllm.layers.utils import shard_slice
 
 
 class VocabParallelEmbedding(nn.Module):
@@ -28,7 +29,7 @@ class VocabParallelEmbedding(nn.Module):
         param_data = param.data
         shard_size = param_data.size(0)
         start_idx = self.tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)
+        loaded_weight = shard_slice(loaded_weight, 0, start_idx, shard_size)
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor):
