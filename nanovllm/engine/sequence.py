@@ -88,6 +88,8 @@ class Sequence:
         if isinstance(last_state, list):
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]
+            self.is_prefill = True
         else:
             self.token_ids = []
             self.last_token = last_state
+            self.is_prefill = False

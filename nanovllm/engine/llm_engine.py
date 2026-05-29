@@ -51,9 +51,11 @@ class LLMEngine:
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
+        # 混合批 (is_prefill=True) 时 num_tokens 为本步处理的总 token 数(prefill chunk + decode)，
+        # 纯 decode 批为 -len(seqs)，用于 tqdm 区分 prefill / decode 吞吐显示。
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        self.scheduler.postprocess(seqs, token_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
 

@@ -145,7 +145,12 @@ class ModelRunner:
             seqlen_q = seq.num_scheduled_tokens
             end = start + seqlen_q
             seqlen_k = end
-            input_ids.extend(seq[start:end])
+            # decode seq 经 shm 传到 worker 时只带 last_token(token_ids 为空)，故按 is_prefill 取 token：
+            # prefill chunk 用 seq[start:end]，decode 用 last_token。
+            if seq.is_prefill:
+                input_ids.extend(seq[start:end])
+            else:
+                input_ids.append(seq.last_token)
             positions.extend(range(start, end))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
