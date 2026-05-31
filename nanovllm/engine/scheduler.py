@@ -24,7 +24,8 @@ class Scheduler: # 调度器，职责是“每次 step 给 engine 返回一批 s
         self.waiting.append(seq)
 
     # todo：头阻塞（HOL blocking）会出现吗？
-    #   - me：感觉资源分配应该计算过，不可能让一个seq num打爆
+    #   - yw：感觉资源分配应该计算过，不可能让一个seq num打爆
+    #   - yw：优先prefill，prefill和decode分离
     def schedule(self) -> tuple[list[Sequence], bool]: # 本轮要跑的序列列表；本轮是 prefill（True）还是 decode（False）
         # prefill
         scheduled_seqs = []

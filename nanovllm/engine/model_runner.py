@@ -93,6 +93,19 @@ from nanovllm.utils.loader import load_model
 # - 让一些本应在 CPU 上的轻量逻辑（比如调度数据结构、统计、日志）跑到 GPU
 # - 工业界里这叫“ CPU 侧构建元数据，GPU 侧消费 ”，尤其在调度/分页 KV 这种逻辑重的场景很常见
 
+# @torch.inference_mode()
+# 核心作用是： 全局禁用 Autograd（自动求导引擎）的所有相关追踪和版本记录机制。
+### 具体带来了什么好处？
+# 1. 大幅节省显存（Memory）
+#    - 在正常模式下，PyTorch 前向传播（Forward）时会保存计算图和各种中间激活值（Activations），以便后面做反向传播（Backward）算梯度。
+#    - 加上这个注解后，框架知道你不需要算梯度， 就不会保存这些中间状态 。这对 LLM 来说能省下极其庞大的显存。
+# 2. 提升执行速度（Performance / CPU Overhead）
+#    - 正常模式下，每个算子执行时都要检查是否需要记录操作历史、更新版本号等（View Tracking）。
+#    - inference_mode 会完全绕过这些检查，让算子调用的 CPU 开销（Launch Overhead）降到最低。
+# 3. 允许原地修改（In-place Mutations）
+#    - 正常模式下，很多原地修改（如 tensor.add_(1) 或 切片赋值 tensor[:bs] = ... ）容易报错，因为会破坏计算图。
+#    - 推理模式下没有图，你可以放心地做各种 In-place 操作来复用内存（比如 model_runner.py:L238 里的 slot_mapping.fill_(-1) ）。
+
 # 整体定位
 # - ModelRunner 是 执行层（execution） ：把 scheduler 选出的 Sequence 列表变成 GPU 张量输入，设置 attention/head 需要的上下文（context），调用模型 forward + 采样出 token，再把结果返回给 engine。
 # - 同时它还承担 TP 多进程的控制面通信 ：rank0 把“本轮要执行的 method + 参数”通过共享内存广播给 rank>0；rank>0 常驻 loop 收命令执行。
@@ -195,7 +208,6 @@ class ModelRunner:
         self.run(seqs, True) # 跑一次 prefill，让模型/算子完成第一次编译/初始化（flash-attn、torch.compile、CUDA kernel caching 等），同时让显存峰值更接近真实运行。
         torch.cuda.empty_cache() # 清缓存，减少碎片，让后面的 KV cache 分配更稳定。
 
-    # todo：查一下这些cuda的作用和用法
     def allocate_kv_cache(self):
         # 包含层数、head 数、dtype 等信息
         config = self.config
@@ -349,15 +361,15 @@ class ModelRunner:
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
+            graph_vars["slot_mapping"].fill_(-1) # 清空脏数据
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
+            graph_vars["context_lens"].zero_() # 清空脏数据
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             # 为什么 decode 更适合 graph replay；todo：graph replay是什么？
             # - decode 每步算子很多但每步工作量小，CPU launch 开销占比高。
             # - replay 可以显著减少这部分开销，提升 tokens/s。
-            graph.replay()
+            graph.replay() # 在原先录制的graph里完成一次反向传播
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
 
@@ -374,34 +386,55 @@ class ModelRunner:
         return token_ids
 
     # 预先录制 decode 的 CUDA 执行图，让后续 decode 小 batch 省掉大量 Python/CUDA launch 开销。
+    # 为什么只对decode录制计算图
+    # 1. Decode 的情况可枚举（max_seqs=512），Prefill 枚举代价极大（组合爆炸）（max_tokens=16384）
+    # 2. Prefill 的 graph_pool 需求极大,因为可能录制的维度可能是16384*dim的级别
+    # 3. 最根本的算力瓶颈不同（CPU Bound vs. GPU Bound）
+    #     - Decode 是典型的 Memory Bound （因为是极低算术强度的 GEMV）。在极小 Batch 时会暴露出 CPU Launch Overhead，所以需要 CUDA Graph 来抢救这点时间。
+    #     - Prefill 是典型的 Compute Bound （因为是高算术强度的 GEMM）。GPU 算力拉满，CPU 下发根本不是瓶颈，用 CUDA Graph 纯属多此一举。
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        # 模拟decode可能用到的最大内存分配的情况
+        # 它们的大小全是按 max_bs （比如 512）分配的，也就是给最坏情况留足了空间。
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        # - 在实际推理中，当前正在 Decode 的请求数量是动态变化的（可能是 3 个，也可能是 27 个）。
+        # - 但我们不能为 1~512 的每一个 Batch Size 都录制一个图（那得录 512 次，太慢且占显存）。
+        # - 所以我们采取 分桶策略（Bucket） ：只录制 Batch Size 为 1, 2, 4, 8, 16, 32, 48... 时的图。
+        # - 比如当前有 23 个请求要 Decode，我们就去拿 bs=32 的那个图来跑（多出来的 9 个位置用无效数据填充，算子会忽略它们）。
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
-        self.graph_pool = None
+        self.graph_pool = None # model runner全生命周期有效！构建graph时复用之前使用的物理地址，感觉和graph vars的目的差不多
 
+        # 先录制最大的图，能让它一次性向 PyTorch 申请好所需的全部临时显存（Workspace）。然后把这个内存池（Pool）记录下来给后续的小图复用
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+
+            # Warmup ：在正式录制前，先用假数据（全 0）让模型空跑一次。
+            # 这是为了让底层的 CUDA 驱动完成懒加载初始化、内核缓存（Kernel Caching）等操作。
+            # 如果不彩排直接录制，可能会录进一些初始化用的垃圾指令，导致报错。
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+
             if self.graph_pool is None:
-                self.graph_pool = graph.pool()
+                self.graph_pool = graph.pool() # 录完最大的图后，提取出它的内存池供下一次循环用。
             self.graphs[bs] = graph
             torch.cuda.synchronize()
             reset_context()
 
+        # GPU 在 graph.replay() 时，盲目地去读/写它当初录制时记住的那些裸的物理内存地址。
+        # model runner全生命周期有效！ graph_vars 的作用就是让这个地址一直有效（保活keep alive），不被 GC！！
         self.graph_vars = dict(
             input_ids=input_ids,
             positions=positions,
