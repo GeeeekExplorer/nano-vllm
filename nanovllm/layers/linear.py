@@ -29,9 +29,22 @@ class LinearBase(nn.Module):
             self.bias.weight_loader = self.weight_loader
         else:
             self.register_parameter("bias", None)
+        self.quant_method = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
+
+    def get_weight(self) -> torch.Tensor:
+        if self.quant_method == "fp8":
+            return self.weight.to(self.weight_scale.dtype) * self.weight_scale
+        return self.weight
+
+    def quantize_fp8_(self):
+        w = self.weight.data
+        scale = (w.abs().amax(dim=1, keepdim=True) / torch.finfo(torch.float8_e4m3fn).max).clamp_(min=1e-12)
+        self.weight = nn.Parameter((w / scale).to(torch.float8_e4m3fn), requires_grad=False)
+        self.register_buffer("weight_scale", scale)
+        self.quant_method = "fp8"
 
 
 class ReplicatedLinear(LinearBase):
@@ -48,7 +61,7 @@ class ReplicatedLinear(LinearBase):
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight, self.bias)
+        return F.linear(x, self.get_weight(), self.bias)
 
 
 class ColumnParallelLinear(LinearBase):
@@ -70,7 +83,7 @@ class ColumnParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight, self.bias)
+        return F.linear(x, self.get_weight(), self.bias)
 
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
@@ -150,7 +163,13 @@ class RowParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
+        y = F.linear(x, self.get_weight(), self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
             dist.all_reduce(y)
         return y
+
+
+def quantize_model_fp8(model: nn.Module):
+    for module in model.modules():
+        if isinstance(module, LinearBase):
+            module.quantize_fp8_()
