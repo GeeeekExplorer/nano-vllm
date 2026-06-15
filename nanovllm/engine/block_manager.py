@@ -113,8 +113,22 @@ class BlockManager:
         if start == end: return
         h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
         for i in range(start, end):
-            block = self.blocks[seq.block_table[i]]
+            block_id = seq.block_table[i]
+            block = self.blocks[block_id]
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
             block.update(h, token_ids)
+            if h in self.hash_to_block_id:
+                existing_block_id = self.hash_to_block_id[h]
+                existing_block = self.blocks[existing_block_id]
+                if (
+                    existing_block_id in self.used_block_ids
+                    and existing_block.token_ids == token_ids
+                ):
+                    seq.block_table[i] = existing_block_id
+                    existing_block.ref_count += 1
+                    block.ref_count -= 1
+                    if block.ref_count == 0:
+                        self._deallocate_block(block_id)
+                    continue
             self.hash_to_block_id[h] = block.block_id
