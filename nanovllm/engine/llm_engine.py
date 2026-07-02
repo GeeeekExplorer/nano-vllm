@@ -32,6 +32,7 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self._is_sleeping = False
         atexit.register(self.exit)
 
     def exit(self):
@@ -41,12 +42,14 @@ class LLMEngine:
             p.join()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+        self._assert_awake()
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
 
     def step(self):
+        self._assert_awake()
         seqs, is_prefill = self.scheduler.schedule()
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
@@ -57,12 +60,38 @@ class LLMEngine:
     def is_finished(self):
         return self.scheduler.is_finished()
 
+    def _assert_awake(self):
+        if self._is_sleeping:
+            raise RuntimeError("The engine is sleeping. Call wake_up() before inference.")
+
+    def sleep(self, level: int = 1):
+        if level != 1:
+            raise NotImplementedError("Only KV cache sleep (level=1) is supported.")
+        if self._is_sleeping:
+            return
+        if not self.is_finished():
+            raise RuntimeError("Cannot sleep while requests are still in progress.")
+        self.model_runner.call("sleep", level)
+        self.scheduler.reset()
+        self._is_sleeping = True
+
+    def wake_up(self, tags: list[str] | None = None):
+        tags = ["kv_cache"] if tags is None else tags
+        if set(tags) != {"kv_cache"}:
+            raise NotImplementedError("Only wake_up(tags=['kv_cache']) is supported.")
+        if not self._is_sleeping:
+            return
+        self.model_runner.call("wake_up", tags)
+        self.scheduler.reset()
+        self._is_sleeping = False
+
     def generate(
         self,
         prompts: list[str] | list[list[int]],
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[str]:
+        self._assert_awake()
         pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
