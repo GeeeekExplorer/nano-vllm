@@ -14,7 +14,7 @@ from nanovllm.utils.loader import load_model
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(self, config: Config, rank: int, event: Event | list[Event], ack_event: Event | list[Event]):
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
@@ -22,6 +22,7 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.ack_event = ack_event
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -71,10 +72,19 @@ class ModelRunner:
         n = int.from_bytes(self.shm.buf[0:4], "little")
         method_name, *args = pickle.loads(self.shm.buf[4:n+4])
         self.event.clear()
+        # Acknowledge that the payload has been fully read so rank0 may safely
+        # reuse the shared buffer for the next command.
+        self.ack_event.set()
         return method_name, args
 
     def write_shm(self, method_name, *args):
         assert self.world_size > 1 and self.rank == 0
+        # Wait until every worker has finished reading the previous command
+        # before overwriting the shared buffer; otherwise a worker still
+        # reading the old payload sees corrupted data (UnpicklingError).
+        for ack_event in self.ack_event:
+            ack_event.wait()
+            ack_event.clear()
         data = pickle.dumps([method_name, *args])
         n = len(data)
         self.shm.buf[0:4] = n.to_bytes(4, "little")

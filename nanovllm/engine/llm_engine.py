@@ -21,14 +21,19 @@ class LLMEngine:
         Sequence.block_size = config.kvcache_block_size
         self.ps = []
         self.events = []
+        self.ack_events = []
         ctx = mp.get_context("spawn")
         for i in range(1, config.tensor_parallel_size):
             event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
+            ack_event = ctx.Event()
+            # Pre-set so rank0 can write the first command before any read.
+            ack_event.set()
+            process = ctx.Process(target=ModelRunner, args=(config, i, event, ack_event))
             process.start()
             self.ps.append(process)
             self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
+            self.ack_events.append(ack_event)
+        self.model_runner = ModelRunner(config, 0, self.events, self.ack_events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
