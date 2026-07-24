@@ -140,8 +140,16 @@ class Qwen3DecoderLayer(nn.Module):
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # FlashNorm (arxiv:2407.09577) folds decoder-layer RMSNorm scales into
+        # the next Linear. When config.flash_norm is true, skip those weights.
+        # Final model.norm and Attention q/k norms keep learnable weights.
+        has_weight = not getattr(config, "flash_norm", False)
+        self.input_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, has_weight=has_weight
+        )
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, has_weight=has_weight
+        )
 
     def forward(
         self,
