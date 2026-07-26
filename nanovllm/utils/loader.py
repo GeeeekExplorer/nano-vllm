@@ -1,8 +1,19 @@
 import os
 from glob import glob
 import torch
+import importlib
 from torch import nn
 from safetensors import safe_open
+from nanovllm.models.registry import NANO_VLLM_MODELS
+
+def load_model_arch_from_config(hf_config):
+    arch = hf_config.architectures[0]
+    if arch not in NANO_VLLM_MODELS:
+        raise ValueError(f"Unsupported architecture: {arch}")
+    module_name, class_name = NANO_VLLM_MODELS[arch]
+    module = importlib.import_module(f"nanovllm.models.{module_name}")
+    model_cls = getattr(module, class_name)
+    return model_cls
 
 
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
