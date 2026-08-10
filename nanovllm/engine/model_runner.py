@@ -5,6 +5,7 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
+from nanovllm.engine.decode_input_batch import DecodeInputBatch
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
@@ -170,6 +171,24 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
+        if (
+            not self.enforce_eager
+            and hasattr(self, "decode_input_batch")
+            and len(seqs) <= 512
+        ):
+            batch_size = len(seqs)
+            graph_bucket = next(x for x in self.graph_bs if x >= batch_size)
+            self.decode_input_batch.prepare_decode(
+                seqs,
+                graph_bucket,
+                include_temperatures=self.rank == 0,
+            )
+            set_context(False)
+            return (
+                self.decode_input_batch.input_ids_cpu[:batch_size],
+                self.decode_input_batch.positions_cpu[:batch_size],
+            )
+
         input_ids = []
         positions = []
         slot_mapping = []
@@ -187,7 +206,14 @@ class ModelRunner:
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
-    def prepare_sample(self, seqs: list[Sequence]):
+    def prepare_sample(self, seqs: list[Sequence], is_prefill: bool):
+        if (
+            not is_prefill
+            and not self.enforce_eager
+            and hasattr(self, "decode_input_batch")
+            and len(seqs) <= 512
+        ):
+            return self.decode_input_batch.copy_temperatures_to_gpu(len(seqs))
         temperatures = [seq.temperature for seq in seqs]
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
@@ -198,22 +224,46 @@ class ModelRunner:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
-            context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            graph_bucket = next(x for x in self.graph_bs if x >= bs)
+            graph = self.graphs[graph_bucket]
             graph_vars = self.graph_vars
-            graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"][:bs] = context.context_lens
-            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+            if input_ids.device.type == "cpu" and hasattr(self, "decode_input_batch"):
+                decode_batch = self.decode_input_batch
+                view = decode_batch.last_view
+                if view is None or view.batch_size != bs or view.graph_bucket != graph_bucket:
+                    raise RuntimeError("CUDA graph decode metadata does not match the active batch")
+                graph_vars["input_ids"][:graph_bucket].copy_(
+                    decode_batch.input_ids_cpu[:graph_bucket], non_blocking=True
+                )
+                graph_vars["positions"][:graph_bucket].copy_(
+                    decode_batch.positions_cpu[:graph_bucket], non_blocking=True
+                )
+                graph_vars["slot_mapping"][:graph_bucket].copy_(
+                    decode_batch.slot_mapping_cpu[:graph_bucket], non_blocking=True
+                )
+                graph_vars["context_lens"][:graph_bucket].copy_(
+                    decode_batch.context_lens_cpu[:graph_bucket], non_blocking=True
+                )
+                active_width = view.active_block_width
+                graph_vars["block_tables"][:graph_bucket, :active_width].copy_(
+                    decode_batch.block_tables_cpu[:graph_bucket, :active_width],
+                    non_blocking=True,
+                )
+            else:
+                context = get_context()
+                graph_vars["input_ids"][:bs] = input_ids
+                graph_vars["positions"][:bs] = positions
+                graph_vars["slot_mapping"].fill_(-1)
+                graph_vars["slot_mapping"][:bs] = context.slot_mapping
+                graph_vars["context_lens"].zero_()
+                graph_vars["context_lens"][:bs] = context.context_lens
+                graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        temperatures = self.prepare_sample(seqs, is_prefill) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
@@ -255,3 +305,13 @@ class ModelRunner:
             block_tables=block_tables,
             outputs=outputs,
         )
+        # Decode metadata is filled between graph replays, outside inference mode.
+        with torch.inference_mode(False):
+            self.decode_input_batch = DecodeInputBatch(
+                max_bs,
+                max_num_blocks,
+                self.block_size,
+                pin_memory=True,
+                allocate_temperature_gpu=self.rank == 0,
+                device="cuda",
+            )
