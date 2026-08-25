@@ -43,6 +43,10 @@ outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
 
+## Scope and Limitations
+
+Nano-vLLM is a compact educational inference engine rather than a drop-in replacement for vLLM. It currently provides a built-in Qwen3 model implementation and requires a CUDA-capable NVIDIA GPU. The project performs inference only; it does not train models or provide model weights or training datasets. Validate model compatibility, output quality, and performance on your target hardware before using it in production.
+
 ## Benchmark
 
 See `bench.py` for benchmark.
@@ -60,6 +64,9 @@ See `bench.py` for benchmark.
 | vLLM           | 133,966     | 98.37    | 1361.84               |
 | Nano-vLLM      | 133,966     | 93.41    | 1434.13               |
 
+## License
+
+Nano-vLLM is available under the [MIT License](LICENSE).
 
 ## Star History
 
