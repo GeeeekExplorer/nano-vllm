@@ -111,6 +111,16 @@ class ModelRunner:
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        if self.world_size > 1:
+            # The logical KV-cache block space must be identical across TP ranks
+            # (the same block ids are used for a sequence on every rank, while
+            # each rank only stores its own KV-head shard). Different ranks may
+            # estimate different local capacities depending on GPU memory state,
+            # so take the minimum across ranks to guarantee every rank's physical
+            # KV-cache pool is at least as large as the shared BlockManager pool.
+            local = torch.tensor([config.num_kvcache_blocks], dtype=torch.int64, device="cuda")
+            dist.all_reduce(local, op=dist.ReduceOp.MIN)
+            config.num_kvcache_blocks = int(local.item())
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
