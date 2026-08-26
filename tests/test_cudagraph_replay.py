@@ -32,10 +32,19 @@ class CudaGraphReplayTest(unittest.TestCase):
 
     def test_capture_reserves_the_first_decode_block(self):
         runner = self.make_runner()
-        runner.config = SimpleNamespace(max_model_len=4096)
-        runner.block_size = 256
-
-        self.assertEqual(runner._cudagraph_block_table_width(), 17)
+        cases = [
+            (1, 256, 2),
+            (255, 256, 2),
+            (256, 256, 2),
+            (257, 256, 3),
+            (4096, 256, 17),
+            (4097, 256, 18),
+        ]
+        for max_model_len, block_size, expected in cases:
+            runner.config = SimpleNamespace(max_model_len=max_model_len)
+            runner.block_size = block_size
+            with self.subTest(max_model_len=max_model_len, block_size=block_size):
+                self.assertEqual(runner._cudagraph_block_table_width(), expected)
 
     def test_replay_requires_runtime_inputs_to_fit_captured_buffers(self):
         runner = self.make_runner()
@@ -62,23 +71,86 @@ class CudaGraphReplayTest(unittest.TestCase):
             runner.enforce_eager = False
             self.assertFalse(runner._can_use_cudagraph(torch.empty(2), False))
 
+    def test_runtime_shape_matrix_never_replays_outside_capture(self):
+        runner = self.make_runner(block_table_width=17)
+        runner.graph_bs = [1, 2, 4, 8, 16, 32]
+
+        for batch_size in [1, 2, 3, 8, 17, 32, 33, 64]:
+            for block_table_width in [1, 2, 16, 17, 18, 33]:
+                context = SimpleNamespace(
+                    block_tables=torch.empty(batch_size, block_table_width, dtype=torch.int32),
+                )
+                with patch("nanovllm.engine.model_runner.get_context", return_value=context):
+                    actual = runner._can_use_cudagraph(torch.empty(batch_size), False)
+                expected = batch_size <= 32 and block_table_width <= 17
+                with self.subTest(batch_size=batch_size, block_table_width=block_table_width):
+                    self.assertEqual(actual, expected)
+
     def test_oversized_block_table_falls_back_to_eager(self):
         for device in self.devices():
             with self.subTest(device=device):
-                runner = self.make_runner(device=device)
+                runner = self.make_runner(block_table_width=16, device=device)
+                runner.graph_bs = [1, 2, 4, 8, 16, 32]
+                runner.graphs = {32: FakeGraph()}
+                runner.graph_vars.update({
+                    "input_ids": torch.zeros(32, dtype=torch.int64, device=device),
+                    "positions": torch.zeros(32, dtype=torch.int64, device=device),
+                    "slot_mapping": torch.zeros(32, dtype=torch.int32, device=device),
+                    "context_lens": torch.zeros(32, dtype=torch.int32, device=device),
+                    "block_tables": torch.empty(32, 16, dtype=torch.int32, device=device),
+                    "outputs": torch.zeros(32, 8, device=device),
+                })
                 runner.model = Mock()
-                runner.model.return_value = torch.zeros(2, 8, device=device)
+                runner.model.return_value = torch.zeros(32, 8, device=device)
                 runner.model.compute_logits.side_effect = lambda outputs: outputs
                 context = SimpleNamespace(
-                    block_tables=torch.empty(2, 5, dtype=torch.int32, device=device),
+                    slot_mapping=torch.arange(32, dtype=torch.int32, device=device),
+                    context_lens=torch.full((32,), 4097, dtype=torch.int32, device=device),
+                    block_tables=torch.empty(32, 17, dtype=torch.int32, device=device),
                 )
-                input_ids = torch.tensor([11, 12], device=device)
-                positions = torch.tensor([256, 128], device=device)
+                input_ids = torch.arange(32, device=device)
+                positions = torch.arange(32, device=device)
 
                 with patch("nanovllm.engine.model_runner.get_context", return_value=context):
                     runner.run_model(input_ids, positions, False)
 
                 runner.model.assert_called_once_with(input_ids, positions)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_real_cudagraph_replay_clears_narrower_runtime_table(self):
+        runner = self.make_runner(device="cuda")
+        runner.graph_vars.update({
+            "input_ids": torch.zeros(4, dtype=torch.int64, device="cuda"),
+            "positions": torch.zeros(4, dtype=torch.int64, device="cuda"),
+            "slot_mapping": torch.zeros(4, dtype=torch.int32, device="cuda"),
+            "context_lens": torch.zeros(4, dtype=torch.int32, device="cuda"),
+            "block_tables": torch.zeros(4, 4, dtype=torch.int32, device="cuda"),
+            "outputs": torch.zeros(4, 4, dtype=torch.int32, device="cuda"),
+        })
+        runner.model = SimpleNamespace(compute_logits=lambda outputs: outputs)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            runner.graph_vars["outputs"].copy_(runner.graph_vars["block_tables"])
+        runner.graphs = {2: graph}
+
+        for step, width in enumerate([4, 1, 3, 2, 4, 1] * 10):
+            block_tables = torch.arange(2 * width, dtype=torch.int32, device="cuda").view(2, width) + step
+            context = SimpleNamespace(
+                slot_mapping=torch.tensor([7, 8], dtype=torch.int32, device="cuda"),
+                context_lens=torch.tensor([257, 129], dtype=torch.int32, device="cuda"),
+                block_tables=block_tables,
+            )
+            with patch("nanovllm.engine.model_runner.get_context", return_value=context):
+                outputs = runner.run_model(
+                    torch.tensor([11, 12], device="cuda"),
+                    torch.tensor([256, 128], device="cuda"),
+                    False,
+                )
+
+            expected = torch.full((2, 4), -1, dtype=torch.int32, device="cuda")
+            expected[:, :width] = block_tables
+            self.assertTrue(torch.equal(outputs, expected))
 
     def test_replay_clears_stale_block_table_entries(self):
         for device in self.devices():
