@@ -192,24 +192,36 @@ class ModelRunner:
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
 
+    def _can_use_cudagraph(self, input_ids: torch.Tensor, is_prefill: bool) -> bool:
+        if is_prefill or self.enforce_eager:
+            return False
+        context = get_context()
+        return (
+            input_ids.size(0) <= self.graph_bs[-1]
+            and context.block_tables.size(1) <= self.graph_vars["block_tables"].size(1)
+        )
+
+    def _cudagraph_block_table_width(self) -> int:
+        return (self.config.max_model_len + self.block_size - 1) // self.block_size + 1
+
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+        if not self._can_use_cudagraph(input_ids, is_prefill):
             return self.model.compute_logits(self.model(input_ids, positions))
-        else:
-            bs = input_ids.size(0)
-            context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
-            graph_vars = self.graph_vars
-            graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"][:bs] = context.context_lens
-            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-            graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+        bs = input_ids.size(0)
+        context = get_context()
+        graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+        graph_vars = self.graph_vars
+        graph_vars["input_ids"][:bs] = input_ids
+        graph_vars["positions"][:bs] = positions
+        graph_vars["slot_mapping"].fill_(-1)
+        graph_vars["slot_mapping"][:bs] = context.slot_mapping
+        graph_vars["context_lens"].zero_()
+        graph_vars["context_lens"][:bs] = context.context_lens
+        graph_vars["block_tables"].fill_(-1)
+        graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+        graph.replay()
+        return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
@@ -224,7 +236,8 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
-        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        # A full prompt can need one more block for its first decode token.
+        max_num_blocks = self._cudagraph_block_table_width()
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
