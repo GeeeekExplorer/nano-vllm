@@ -202,7 +202,7 @@ class ModelRunner:
         )
 
     def _cudagraph_block_table_width(self) -> int:
-        return (self.config.max_model_len + self.block_size - 1) // self.block_size + 1
+        return (self.config.max_model_len + self.block_size) // self.block_size
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
