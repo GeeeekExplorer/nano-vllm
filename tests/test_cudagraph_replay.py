@@ -33,12 +33,13 @@ class CudaGraphReplayTest(unittest.TestCase):
     def test_capture_reserves_the_first_decode_block(self):
         runner = self.make_runner()
         cases = [
-            (1, 256, 2),
-            (255, 256, 2),
+            (1, 256, 1),
+            (255, 256, 1),
             (256, 256, 2),
-            (257, 256, 3),
+            (257, 256, 2),
+            (4095, 256, 16),
             (4096, 256, 17),
-            (4097, 256, 18),
+            (4097, 256, 17),
         ]
         for max_model_len, block_size, expected in cases:
             runner.config = SimpleNamespace(max_model_len=max_model_len)
