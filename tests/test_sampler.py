@@ -1,6 +1,9 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.engine.sequence import Sequence
 from nanovllm.layers.sampler import Sampler, apply_top_k_top_p
 from nanovllm.sampling_params import SamplingParams
@@ -81,6 +84,30 @@ def test_sampler_never_selects_filtered_tokens():
 def test_disabled_filters_preserve_logits():
     logits = torch.randn(3, 17)
     assert apply_top_k_top_p(logits, None, None, max_top_k=0) is logits
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_prepare_sample_normalizes_mixed_and_oversized_top_k():
+    runner = object.__new__(ModelRunner)
+    runner.config = SimpleNamespace(hf_config=SimpleNamespace(vocab_size=5))
+    seqs = [
+        Sequence([1], SamplingParams(temperature=0.2, top_k=2)),
+        Sequence([1], SamplingParams(temperature=0.4, top_k=100, top_p=0.7)),
+        Sequence([1], SamplingParams(temperature=0.6)),
+    ]
+    temperatures, top_ks, top_ps, max_top_k = runner.prepare_sample(seqs)
+    torch.testing.assert_close(temperatures, torch.tensor([0.2, 0.4, 0.6], device="cuda"))
+    assert top_ks.tolist() == [2, 5, 5]
+    torch.testing.assert_close(top_ps, torch.tensor([1.0, 0.7, 1.0], device="cuda"))
+    assert max_top_k == 2
+
+    _, top_ks, top_ps, max_top_k = runner.prepare_sample([
+        Sequence([1], SamplingParams(top_k=5)),
+        Sequence([1], SamplingParams(top_k=100)),
+    ])
+    assert top_ks is None
+    assert top_ps is None
+    assert max_top_k == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
