@@ -15,6 +15,7 @@ A lightweight vLLM implementation built from scratch.
 * 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
 * 📖 **Readable codebase** - Clean implementation in ~ 1,200 lines of Python code
 * ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Torch compilation, CUDA graph, etc.
+* 🎯 **Configurable sampling** - Per-request temperature, top-k, and top-p sampling
 
 ## Installation
 
@@ -37,7 +38,7 @@ See `example.py` for usage. The API mirrors vLLM's interface with minor differen
 ```python
 from nanovllm import LLM, SamplingParams
 llm = LLM("/YOUR/MODEL/PATH", enforce_eager=True, tensor_parallel_size=1)
-sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
+sampling_params = SamplingParams(temperature=0.6, top_p=0.9, top_k=50, max_tokens=256)
 prompts = ["Hello, Nano-vLLM."]
 outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
