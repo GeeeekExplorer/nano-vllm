@@ -9,6 +9,14 @@ def divide(numerator, denominator):
     return numerator // denominator
 
 
+def narrow_safetensors_slice(loaded_weight, dim: int, start: int, length: int):
+    """Materialize only one contiguous shard from a safetensors slice."""
+    shape = tuple(loaded_weight.get_shape())
+    index = [slice(None)] * len(shape)
+    index[dim] = slice(start, start + length)
+    return loaded_weight[tuple(index)]
+
+
 class LinearBase(nn.Module):
 
     def __init__(
@@ -61,6 +69,9 @@ class ColumnParallelLinear(LinearBase):
     ):
         tp_size = dist.get_world_size()
         super().__init__(input_size, divide(output_size, tp_size), bias, 0)
+        self.weight.safetensors_loader = self.safetensors_loader
+        if self.bias is not None:
+            self.bias.safetensors_loader = self.safetensors_loader
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
@@ -68,6 +79,13 @@ class ColumnParallelLinear(LinearBase):
         start_idx = self.tp_rank * shard_size
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
         param_data.copy_(loaded_weight)
+
+    def safetensors_loader(self, param: nn.Parameter, loaded_weight):
+        shard_size = param.data.size(self.tp_dim)
+        start_idx = self.tp_rank * shard_size
+        param.data.copy_(narrow_safetensors_slice(
+            loaded_weight, self.tp_dim, start_idx, shard_size
+        ))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self.weight, self.bias)
@@ -91,6 +109,17 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
         param_data.copy_(loaded_weight)
+
+    def safetensors_loader(self, param, loaded_weight, loaded_shard_id: int):
+        shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
+        shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
+        destination = param.data.narrow(self.tp_dim, shard_offset, shard_size)
+        destination.copy_(narrow_safetensors_slice(
+            loaded_weight,
+            self.tp_dim,
+            self.tp_rank * shard_size,
+            shard_size,
+        ))
 
 
 class QKVParallelLinear(ColumnParallelLinear):
@@ -127,6 +156,25 @@ class QKVParallelLinear(ColumnParallelLinear):
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
         param_data.copy_(loaded_weight)
 
+    def safetensors_loader(self, param, loaded_weight, loaded_shard_id: str):
+        assert loaded_shard_id in ["q", "k", "v"]
+        if loaded_shard_id == "q":
+            shard_size = self.num_heads * self.head_size
+            shard_offset = 0
+        elif loaded_shard_id == "k":
+            shard_size = self.num_kv_heads * self.head_size
+            shard_offset = self.num_heads * self.head_size
+        else:
+            shard_size = self.num_kv_heads * self.head_size
+            shard_offset = self.num_heads * self.head_size + self.num_kv_heads * self.head_size
+        destination = param.data.narrow(self.tp_dim, shard_offset, shard_size)
+        destination.copy_(narrow_safetensors_slice(
+            loaded_weight,
+            self.tp_dim,
+            self.tp_rank * shard_size,
+            shard_size,
+        ))
+
 
 class RowParallelLinear(LinearBase):
 
@@ -138,6 +186,7 @@ class RowParallelLinear(LinearBase):
     ):
         tp_size = dist.get_world_size()
         super().__init__(divide(input_size, tp_size), output_size, bias, 1)
+        self.weight.safetensors_loader = self.safetensors_loader
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
@@ -148,6 +197,13 @@ class RowParallelLinear(LinearBase):
         start_idx = self.tp_rank * shard_size
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
         param_data.copy_(loaded_weight)
+
+    def safetensors_loader(self, param: nn.Parameter, loaded_weight):
+        shard_size = param.data.size(self.tp_dim)
+        start_idx = self.tp_rank * shard_size
+        param.data.copy_(narrow_safetensors_slice(
+            loaded_weight, self.tp_dim, start_idx, shard_size
+        ))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)

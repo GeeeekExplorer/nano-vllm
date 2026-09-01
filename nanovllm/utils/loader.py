@@ -19,10 +19,18 @@ def load_model(model: nn.Module, path: str):
                         v, shard_id = packed_modules_mapping[k]
                         param_name = weight_name.replace(k, v)
                         param = model.get_parameter(param_name)
-                        weight_loader = getattr(param, "weight_loader")
-                        weight_loader(param, f.get_tensor(weight_name), shard_id)
+                        safetensors_loader = getattr(param, "safetensors_loader", None)
+                        if safetensors_loader is not None:
+                            safetensors_loader(param, f.get_slice(weight_name), shard_id)
+                        else:
+                            weight_loader = getattr(param, "weight_loader")
+                            weight_loader(param, f.get_tensor(weight_name), shard_id)
                         break
                 else:
                     param = model.get_parameter(weight_name)
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    weight_loader(param, f.get_tensor(weight_name))
+                    safetensors_loader = getattr(param, "safetensors_loader", None)
+                    if safetensors_loader is not None:
+                        safetensors_loader(param, f.get_slice(weight_name))
+                    else:
+                        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                        weight_loader(param, f.get_tensor(weight_name))
