@@ -1,3 +1,4 @@
+import os
 import pickle
 import torch
 import torch.distributed as dist
@@ -23,7 +24,14 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        if os.name == "nt":
+            # Windows builds of PyTorch ship without libuv; fall back to the
+            # legacy TCPStore so rendezvous does not abort at startup.
+            os.environ.setdefault("USE_LIBUV", "0")
+        # NCCL is only bundled with PyTorch on Linux. On other platforms (or
+        # single-GPU runs, where no cross-GPU collective is issued) gloo works.
+        backend = "nccl" if dist.is_nccl_available() else "gloo"
+        dist.init_process_group(backend, "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
