@@ -66,6 +66,16 @@ class LLMEngine:
         pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
+        # Fast tokenizers amortize batch-dispatch overhead only for larger batches.
+        if len(prompts) >= 32 and isinstance(prompts[0], str):
+            prompts = self.tokenizer(
+                prompts,
+                add_special_tokens=True,
+                padding=False,
+                truncation=False,
+                return_attention_mask=False,
+                return_token_type_ids=False,
+            )["input_ids"]
         for prompt, sp in zip(prompts, sampling_params):
             self.add_request(prompt, sp)
         outputs = {}
