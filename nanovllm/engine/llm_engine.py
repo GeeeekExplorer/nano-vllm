@@ -18,6 +18,7 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        self.max_model_len = config.max_model_len
         Sequence.block_size = config.kvcache_block_size
         self.ps = []
         self.events = []
@@ -43,6 +44,7 @@ class LLMEngine:
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
+        sampling_params.validate_request_length(len(prompt), self.max_model_len)
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
 
