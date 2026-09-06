@@ -25,9 +25,13 @@ class Scheduler:
     def schedule(self) -> tuple[list[Sequence], bool]:
         scheduled_seqs = []
         num_batched_tokens = 0
+        num_running = len(self.running)
 
         # prefill
-        while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
+        while (
+            self.waiting
+            and num_running + len(scheduled_seqs) < self.max_num_seqs
+        ):
             seq = self.waiting[0]
             remaining = self.max_num_batched_tokens - num_batched_tokens
             if remaining == 0:
