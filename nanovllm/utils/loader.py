@@ -1,5 +1,6 @@
 import os
 from glob import glob
+import json
 import torch
 from torch import nn
 from safetensors import safe_open
@@ -11,7 +12,24 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
 
 def load_model(model: nn.Module, path: str):
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
-    for file in glob(os.path.join(path, "*.safetensors")):
+    files = sorted(
+        file
+        for file in glob(os.path.join(path, "*.safetensors"))
+        if os.path.isfile(file)
+    )
+    if not files:
+        raise FileNotFoundError(f"no safetensors files found in model path: {path}")
+    available = {os.path.basename(file) for file in files}
+    for index_file in glob(os.path.join(path, "*.safetensors.index.json")):
+        with open(index_file, encoding="utf-8") as stream:
+            index = json.load(stream)
+        missing = sorted(set(index["weight_map"].values()) - available)
+        if missing:
+            raise FileNotFoundError(
+                f"missing safetensors shards referenced by {index_file}: "
+                + ", ".join(missing)
+            )
+    for file in files:
         with safe_open(file, "pt", "cpu") as f:
             for weight_name in f.keys():
                 for k in packed_modules_mapping:
