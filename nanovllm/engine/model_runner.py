@@ -193,9 +193,11 @@ class ModelRunner:
         return temperatures
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            return self.model.compute_logits(self.model(input_ids, positions))
+    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, has_prefill: bool):
+        """执行模型前向并返回 hidden states，保留纯 decode 的 CUDA Graph 快路径。"""
+        if has_prefill or self.enforce_eager or input_ids.size(0) > 512:
+            # 混合批的每条序列最后 token 位于不同位置，先返回 hidden states 再按序列采样。
+            return self.model(input_ids, positions)
         else:
             bs = input_ids.size(0)
             context = get_context()
@@ -209,13 +211,45 @@ class ModelRunner:
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+            return graph_vars["outputs"][:bs]
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+    @torch.inference_mode()
+    def run(self, seqs: list[Sequence], has_prefill: bool) -> list[int]:
+        """运行一个批次，并只为 final prefill chunk 或 decode 序列执行采样。
+
+        ``has_prefill`` 为真时，decode 被编码成长度为 1 的 prefill chunk，因此
+        统一从各序列 query 段的最后一个 hidden state 计算 logits。
+        """
+        input_ids, positions = self.prepare_prefill(seqs) if has_prefill else self.prepare_decode(seqs)
+        hidden_state = self.run_model(input_ids, positions, has_prefill)
+
+        sample_flags = [seq.should_sample for seq in seqs]
+        sample_seqs = [s for s, f in zip(seqs, sample_flags) if f]
+
+        sampled = None
+        if sample_seqs:
+            if has_prefill:
+                cu_seqlens_q = get_context().cu_seqlens_q
+                flags_t = torch.tensor(sample_flags, dtype=torch.bool, device=cu_seqlens_q.device)
+                idx = torch.nonzero(flags_t, as_tuple=True)[0]
+                last_indices = (cu_seqlens_q[idx + 1] - 1).long()
+                selected_hidden = hidden_state[last_indices]
+            else:
+                selected_hidden = hidden_state
+            logits = self.model.compute_logits(selected_hidden)
+            temperatures = self.prepare_sample(sample_seqs) if self.rank == 0 else None
+            sampled = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+
+        token_ids = None
+        if self.rank == 0:
+            # 非 final prefill chunk 不消费 token_id；占位以保持 TP 序列化后的列表长度一致。
+            token_ids = [0] * len(seqs)
+            if sampled is not None:
+                pos = 0
+                for i, f in enumerate(sample_flags):
+                    if f:
+                        token_ids[i] = sampled[pos]
+                        pos += 1
         reset_context()
         return token_ids
 
