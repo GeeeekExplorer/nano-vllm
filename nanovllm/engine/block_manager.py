@@ -55,7 +55,12 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
-    def can_allocate(self, seq: Sequence) -> int:
+    def can_allocate(self, seq: Sequence) -> tuple[int, int]:
+        """返回可复用前缀块数及本次实际需要从 free list 获取的新块数。
+
+        第二个返回值必须扣除已处于 used 集合的共享前缀块，供调度器在接纳
+        新 prefill 前准确执行 KV block watermark 检查。
+        """
         h = -1
         num_cached_blocks = 0
         num_new_blocks = seq.num_blocks
@@ -69,8 +74,8 @@ class BlockManager:
             if block_id in self.used_block_ids:
                 num_new_blocks -= 1
         if len(self.free_block_ids) < num_new_blocks:
-            return -1
-        return num_cached_blocks
+            return -1, -1
+        return num_cached_blocks, num_new_blocks
 
     def allocate(self, seq: Sequence, num_cached_blocks: int):
         assert not seq.block_table
