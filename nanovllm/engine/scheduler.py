@@ -68,7 +68,15 @@ class Scheduler:
                 seq.is_prefill = False
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
-        assert scheduled_seqs
+
+        if not scheduled_seqs:
+            raise RuntimeError(
+                f"KV cache exhausted: sequence {seq.seq_id} needs more blocks than "
+                f"num_kvcache_blocks provides in total, even after preempting every "
+                f"other running sequence. Increase num_kvcache_blocks or reduce "
+                f"max_model_len / max_tokens."
+            )
+
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
 
