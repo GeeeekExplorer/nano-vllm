@@ -43,6 +43,10 @@ outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
 
+For workloads with repeated prefixes and KV-cache pressure, opt into queue-aware
+eviction with `LLM("/YOUR/MODEL/PATH", prefix_cache_lookahead=16)`.
+The default is `0` (disabled). See [behavior and validation](docs/queue_eviction.md).
+
 ## Benchmark
 
 See `bench.py` for benchmark.
