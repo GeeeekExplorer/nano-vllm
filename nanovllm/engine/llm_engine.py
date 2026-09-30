@@ -45,13 +45,14 @@ class LLMEngine:
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
+        return seq
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        outputs = [(seq.seq_id, seq.completion_token_ids, seq.finish_reason) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
 
     def is_finished(self):
@@ -66,9 +67,12 @@ class LLMEngine:
         pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
-        for prompt, sp in zip(prompts, sampling_params):
-            self.add_request(prompt, sp)
         outputs = {}
+        for prompt, sp in zip(prompts, sampling_params):
+            seq = self.add_request(prompt, sp)
+            if seq.is_finished:
+                outputs[seq.seq_id] = (seq.completion_token_ids, seq.finish_reason)
+                pbar.update(1)
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():
             t = perf_counter()
@@ -81,10 +85,11 @@ class LLMEngine:
                 "Prefill": f"{int(prefill_throughput)}tok/s",
                 "Decode": f"{int(decode_throughput)}tok/s",
             })
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
+            for seq_id, token_ids, finish_reason in output:
+                outputs[seq_id] = (token_ids, finish_reason)
                 pbar.update(1)
         pbar.close()
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids, "finish_reason": finish_reason}
+                   for token_ids, finish_reason in outputs]
         return outputs
