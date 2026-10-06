@@ -2,6 +2,12 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
+from nanovllm.layers.w8a16_gemm import w8a16_linear
+
+# Set to True by the weight loader when quantization="int8" is active.
+# All LinearBase subclasses read this flag at forward-time to decide
+# whether to dequantize weights before the matmul.
+_INT8_QUANTIZED = False
 
 
 def divide(numerator, denominator):
@@ -22,13 +28,36 @@ class LinearBase(nn.Module):
         self.tp_dim = tp_dim
         self.tp_rank = dist.get_rank()
         self.tp_size = dist.get_world_size()
-        self.weight = nn.Parameter(torch.empty(output_size, input_size))
+
+        if _INT8_QUANTIZED:
+            # Store weights as int8 to halve VRAM usage.
+            # Per-output-channel float scale is kept in a non-parameter buffer
+            # so it is moved to the correct device with .to() / .cuda() but is
+            # not treated as a learnable parameter.
+            self.weight = nn.Parameter(
+                torch.empty(output_size, input_size, dtype=torch.int8),
+                requires_grad=False,
+            )
+            # Shape [output_size, 1] so it broadcasts correctly over input dim
+            # during dequantization:  weight_fp = weight * weight_scale
+            self.register_buffer(
+                "weight_scale",
+                torch.ones(output_size, 1, dtype=torch.float32),  # filled by loader
+            )
+        else:
+            self.weight = nn.Parameter(torch.empty(output_size, input_size))
+
         self.weight.weight_loader = self.weight_loader
+
         if bias:
             self.bias = nn.Parameter(torch.empty(output_size))
             self.bias.weight_loader = self.weight_loader
         else:
             self.register_parameter("bias", None)
+
+    def _dequant_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Fused W8A16 forward: loads int8 from VRAM, dequantizes in SRAM."""
+        return w8a16_linear(x, self.weight, self.weight_scale, self.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
@@ -48,6 +77,8 @@ class ReplicatedLinear(LinearBase):
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if _INT8_QUANTIZED:
+            return self._dequant_forward(x)
         return F.linear(x, self.weight, self.bias)
 
 
@@ -70,6 +101,8 @@ class ColumnParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if _INT8_QUANTIZED:
+            return self._dequant_forward(x)
         return F.linear(x, self.weight, self.bias)
 
 
@@ -150,7 +183,11 @@ class RowParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
+        if _INT8_QUANTIZED:
+            y = w8a16_linear(x, self.weight, self.weight_scale,
+                             self.bias if self.tp_rank == 0 else None)
+        else:
+            y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
             dist.all_reduce(y)
         return y

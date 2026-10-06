@@ -1,3 +1,5 @@
+import os
+import os
 import pickle
 import torch
 import torch.distributed as dist
@@ -10,6 +12,7 @@ from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+import nanovllm.layers.linear as _linear_module
 
 
 class ModelRunner:
@@ -23,13 +26,25 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+       # dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        if os.name == "nt":
+            # Windows builds of PyTorch ship without libuv; fall back to the
+            # legacy TCPStore so rendezvous does not abort at startup.
+           os.environ.setdefault("USE_LIBUV", "0")
+        # NCCL is only bundled with PyTorch on Linux. On other platforms (or
+        # single-GPU runs, where no cross-GPU collective is issued) gloo works.
+        backend = "nccl" if dist.is_nccl_available() else "gloo"
+        dist.init_process_group(backend, "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
+        # Set the INT8 flag BEFORE constructing the model so LinearBase.__init__
+        # allocates int8 weight tensors and weight_scale buffers from the start.
+        if config.quantization == "int8":
+            _linear_module._INT8_QUANTIZED = True
         self.model = Qwen3ForCausalLM(hf_config)
-        load_model(self.model, config.model)
+        load_model(self.model, config.model, quantization=config.quantization)
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
@@ -90,13 +105,17 @@ class ModelRunner:
 
     def warmup_model(self):
         torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         seq_len = min(max_num_batched_tokens, max_model_len)
         num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
+        # Initial run to compile any JIT kernels (Triton / PyTorch)
+        self.run(seqs, True)
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        # Measure true activation peak on already-compiled kernels
         self.run(seqs, True)
         torch.cuda.empty_cache()
 
