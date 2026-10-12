@@ -63,6 +63,8 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[str]:
+        if isinstance(sampling_params, list) and len(sampling_params) != len(prompts):
+            raise ValueError("sampling_params must contain exactly one entry per prompt")
         pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
