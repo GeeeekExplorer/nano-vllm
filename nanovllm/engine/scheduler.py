@@ -1,8 +1,13 @@
-from collections import deque
+from __future__ import annotations
 
-from nanovllm.config import Config
+from collections import deque
+from typing import TYPE_CHECKING
+
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
+
+if TYPE_CHECKING:
+    from nanovllm.config import Config
 
 
 class Scheduler:
