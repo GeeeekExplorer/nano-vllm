@@ -43,6 +43,18 @@ class Scheduler:
                 break
             if not seq.block_table:
                 self.block_manager.allocate(seq, num_cached_blocks)
+
+            else:
+                # Fix: Boundary OOB error in chunked prefill by adding incremental block allocation
+                end_pos = seq.num_cached_tokens + seq.num_scheduled_tokens
+                required_blocks = (end_pos + self.block_size - 1) // self.block_size
+                extra_blocks = required_blocks - len(seq.block_table)
+                
+                if extra_blocks > 0:
+                    if len(self.block_manager.free_block_ids) < extra_blocks:
+                        break
+                    while len(seq.block_table) < required_blocks:
+                        seq.block_table.append(self.block_manager._allocate_block())
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             num_batched_tokens += seq.num_scheduled_tokens
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
