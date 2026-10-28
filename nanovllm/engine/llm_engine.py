@@ -1,5 +1,4 @@
 import atexit
-from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
@@ -15,9 +14,7 @@ from nanovllm.engine.model_runner import ModelRunner
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
-        config_fields = {field.name for field in fields(Config)}
-        config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
-        config = Config(model, **config_kwargs)
+        config = Config(model, **kwargs)
         Sequence.block_size = config.kvcache_block_size
         self.ps = []
         self.events = []
