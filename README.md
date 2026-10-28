@@ -43,6 +43,18 @@ outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
 
+Pass `stop_token_ids` to stop a request when any listed token ID is generated:
+```python
+sampling_params = SamplingParams(max_tokens=256, stop_token_ids=[12345, 23456])
+```
+Use non-negative integer IDs from your model's tokenizer. Each request can have
+its own list through the existing per-request `SamplingParams` API. The list is
+copied when the request is added. `None` (the default) or an empty list preserves
+the existing EOS and length-limit behavior. `ignore_eos=True` only disables
+automatic EOS stopping; explicitly listed stop IDs still apply. Tokens in the
+prompt do not trigger stopping. The stopping token is retained in the returned
+`token_ids`, matching the existing EOS behavior.
+
 ## Benchmark
 
 See `bench.py` for benchmark.
