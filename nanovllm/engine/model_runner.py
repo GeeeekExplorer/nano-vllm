@@ -15,6 +15,7 @@ from nanovllm.utils.loader import load_model
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+        Sequence.block_size = config.kvcache_block_size    # spawned workers start with the class default
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
