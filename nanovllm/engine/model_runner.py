@@ -7,6 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.batch_metadata import decode_metadata, padded_block_tables, prefill_metadata
 from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.runtime import DeviceRuntime
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.layers.spec_sampler import sampling_tensors
@@ -31,7 +32,8 @@ def blocks_for_budget(budget_bytes: int, block_bytes: int) -> int:
 class ModelRunner:
     """Runs one model. `kv_role` selects which KVState of a Sequence its KV cache belongs to."""
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event], *, kv_role: str = "target"):
+    def __init__(self, config: Config, rank: int, event: Event | list[Event],
+                 *, runtime: DeviceRuntime | None = None, defer_cache: bool = False, kv_role: str = "target"):
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
@@ -45,8 +47,15 @@ class ModelRunner:
         self.has_pad_block = kv_role == "target" and config.num_speculative_tokens > 0
         self.pad_block_id = -1
 
-        torch.cuda.set_device(rank)
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        if runtime is not None and (self.world_size != 1 or config.kv_cache_memory_bytes is None):
+            raise ValueError("Shared runners require TP=1 and an explicit KV budget")
+        if defer_cache and runtime is None:
+            raise ValueError("Deferred initialization requires a shared runtime")
+        self._owns_runtime = runtime is None
+        self.runtime = runtime if runtime is not None else DeviceRuntime(rank, self.world_size)
+        self._exited = False
+        self._cache_initialized = False
+        self.runtime.attach(self)
         self.device = torch.device("cuda", torch.cuda.current_device())
         self.generator = torch.Generator(device=self.device)
         if config.seed is not None:
@@ -59,7 +68,8 @@ class ModelRunner:
             self.model = Qwen3ForCausalLM(hf_config)
             load_model(self.model, config.model)
             self.sampler = Sampler()
-            self.initialize_cache()
+            if not defer_cache:
+                self.initialize_cache()
             if self.world_size > 1:
                 if rank == 0:
                     self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
@@ -74,6 +84,7 @@ class ModelRunner:
             self.loop()
 
     def initialize_cache(self):
+        assert not self._exited and not self._cache_initialized
         default_dtype = torch.get_default_dtype()
         default_device = torch.get_default_device()
         try:
@@ -83,21 +94,27 @@ class ModelRunner:
             self.allocate_kv_cache()
             if not self.enforce_eager:
                 self.capture_cudagraph()
+            self._cache_initialized = True
         finally:
             reset_context()
             torch.set_default_device(default_device)
             torch.set_default_dtype(default_dtype)
 
     def exit(self):
+        if self._exited:
+            return
         if self.world_size > 1:
             self.shm.close()
             dist.barrier()
             if self.rank == 0:
                 self.shm.unlink()
-        if not self.enforce_eager:
+        if not self.enforce_eager and self._cache_initialized:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
-        dist.destroy_process_group()
+        self.runtime.detach(self)
+        self._exited = True
+        if self._owns_runtime:
+            self.runtime.close()
 
     def loop(self):
         while True:

@@ -39,7 +39,7 @@ Measured: steady-state tok/s against plain decoding in the same engine and job, 
 
 ## What this adds
 
-On top of the 0.6B-draft release ([`results-batched-v1`](https://github.com/tianyuantong/nano-vllm-speculative-decoding/tree/results-batched-v1)); the engine is now 2,594 lines. The 0.6B draft itself was removed after [`results-dflash-dspark`](https://github.com/tianyuantong/nano-vllm-speculative-decoding/tree/results-dflash-dspark), the last version with all three drafts.
+On top of the 0.6B-draft release; the engine is now 2,839 lines.
 - **A DFlash block draft**: one 7-query, non-causal pass through the decode path, reading 5 target layers, with context K/V written for every verified position in the target's own blocks. 12 engine files, +434/−107.
 - **DSpark on top of it**: a Markov head draws the 7 rows left to right, and each row hands the acceptance rule the distribution it was drawn from. 4 engine files, +224/−12.
 - **CUDA graphs** for verification, the draft block and DSpark's 7 sampling steps.

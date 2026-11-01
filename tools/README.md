@@ -1,6 +1,6 @@
 # tools
 
-Measurement, gates and analysis for bench-v2 (`benchmarks/protocol-v2.json`). `v1/` keeps the scripts of the September release, which its documents still use; those that run the 0.6B draft run at tag `results-batched-v1`.
+Measurement, gates and analysis for bench-v2 (`benchmarks/protocol-v2.json`). `v1/` keeps the scripts of the September release, which its documents still use.
 
 | Script | What it does |
 |---|---|

@@ -1,4 +1,4 @@
-"""One speculative round per decode batch on top of the target ModelRunner and a block draft (DFlash, DSpark)."""
+"""One speculative round per decode batch on top of a target and a draft ModelRunner."""
 from __future__ import annotations
 
 from collections import Counter
@@ -6,7 +6,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from nanovllm.engine.batch_metadata import draft_block_metadata, prefill_metadata, verify_metadata
+from nanovllm.engine.batch_metadata import (decode_metadata, draft_block_metadata, padded_block_tables,
+                                            prefill_metadata, verify_metadata)
 from nanovllm.engine.sequence import Sequence
 from nanovllm.layers.spec_sampler import (
     SamplingTensors,
@@ -23,6 +24,78 @@ from nanovllm.utils.context import reset_context, set_context
 if TYPE_CHECKING:
     from nanovllm.config import Config
     from nanovllm.engine.model_runner import ModelRunner
+
+
+class ModelDrafter:
+    """A draft model with its own KV cache and decode path (the 0.6B line).
+
+    At round entry its KV covers len-2 or len-1 positions: catch_up fills the missing one, then propose
+    runs k single-token decode steps.
+    """
+
+    def __init__(self, draft: ModelRunner, decoder: SpeculativeDecoder):
+        self.draft = draft
+        self.decoder = decoder    # block size, k, vocabulary, device, the target's generator and the round stats
+
+    @torch.inference_mode()
+    def prefill(self, seqs: list[Sequence], aux: None) -> None:
+        """Run the draft over the chunk the target just prefilled; the scheduler set draft_kv.num_scheduled_tokens.
+        aux is None: this draft reads tokens, not target features."""
+        input_ids, positions = self.draft.prepare_prefill(seqs)
+        self.draft.run_model(input_ids, positions, True, need_logits=False)
+        reset_context()
+
+    def catch_up(self, seqs: list[Sequence]) -> None:
+        """Recompute the one draft KV entry (position len-2) a fully accepted round left missing.
+
+        By the round-entry invariant the gap is exactly one token, so this is a single decode
+        step of the draft through its decode graph; no logits are needed.
+        """
+        decoder = self.decoder
+        for seq in seqs:
+            assert len(seq) - 2 <= seq.draft_kv.num_cached_tokens <= len(seq) - 1
+        lagging = [seq for seq in seqs if seq.draft_kv.num_cached_tokens < len(seq) - 1]
+        if not lagging:
+            return
+        metadata = decode_metadata(lagging, "draft", decoder.block_size, num_steps=1, position_offset=-1)
+        set_context(False,
+                    slot_mapping=decoder._device_tensor(metadata.slot_mapping[0], torch.int32),
+                    context_lens=decoder._device_tensor(metadata.context_lens, torch.int32),
+                    block_tables=decoder._device_tensor(padded_block_tables(lagging, "draft"), torch.int32))
+        self.draft.run_model(decoder._device_tensor(metadata.input_ids, torch.int64),
+                             decoder._device_tensor(metadata.positions, torch.int64), False, need_logits=False)
+        reset_context()
+        for seq in lagging:
+            seq.draft_kv.num_cached_tokens = len(seq) - 1
+        decoder.stats["catch_up_forwards"] += 1
+
+    @torch.inference_mode()
+    def propose(self, seqs: list[Sequence], sampling: SamplingTensors) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """k draft steps through the draft's decode path; returns drafts [B, k] and probabilities [B, k, V] (None when greedy)."""
+        decoder = self.decoder
+        batch_size, k = len(seqs), decoder.num_drafts
+        metadata = decode_metadata(seqs, "draft", decoder.block_size, num_steps=k)
+        input_ids = decoder._device_tensor(metadata.input_ids, torch.int64)
+        positions = decoder._device_tensor(metadata.positions, torch.int64)
+        context_lens = decoder._device_tensor(metadata.context_lens, torch.int32)
+        slot_mapping = decoder._device_tensor(metadata.slot_mapping, torch.int32)          # [k, B]
+        block_tables = decoder._device_tensor(padded_block_tables(seqs, "draft"), torch.int32)
+        drafts = torch.empty(batch_size, k, dtype=torch.int64, device=decoder.device)
+        draft_probs = None
+        if sampling.temperatures is not None:
+            draft_probs = torch.empty(batch_size, k, decoder.vocab_size, dtype=torch.float32, device=decoder.device)
+        for step in range(k):
+            set_context(False, slot_mapping=slot_mapping[step], context_lens=context_lens + step, block_tables=block_tables)
+            logits = self.draft.run_model(input_ids, positions + step, False)
+            if draft_probs is None:
+                tokens = logits.argmax(dim=-1)
+            else:
+                draft_probs[:, step] = probs_from_logits(logits, sampling)
+                tokens = sample(draft_probs[:, step], decoder.target.generator)
+            drafts[:, step] = tokens
+            input_ids = tokens
+        reset_context()
+        return drafts, draft_probs
 
 
 # When every row truncates with top-k, a DSpark row is drawn among its top max_top_k + TIE_MARGIN logits: the
@@ -310,12 +383,13 @@ class DFlashDrafter:
 class SpeculativeDecoder:
     """Drafts, one verification forward, batched acceptance, one D2H copy.
 
-    Round-entry invariant (asserted): target KV covers len-1 positions, and so does the drafter's context K/V
-    that mirrors it. Every active sequence proposes exactly k drafts, so the verification shape is (B, k+1) and a
-    graph keyed by the padded batch size always matches.
+    The drafter is a ModelDrafter when a draft ModelRunner is given (draft_type "model"), else a DFlashDrafter.
+    Round-entry invariant (asserted): target KV covers len-1 positions; each drafter asserts its own. Every
+    active sequence proposes exactly k drafts, so the verification shape is (B, k+1) and a graph keyed by the
+    padded batch size always matches.
     """
 
-    def __init__(self, target: ModelRunner, config: Config):
+    def __init__(self, target: ModelRunner, draft: ModelRunner | None, config: Config):
         self.target = target
         self.num_drafts = config.num_speculative_tokens
         self.block_size = config.kvcache_block_size
@@ -330,16 +404,18 @@ class SpeculativeDecoder:
         self._phase_events: list[tuple[str, object, object]] = []
         self._new_event = None
         self._synchronize = None
-        self.drafter = DFlashDrafter(config, self)
+        self.drafter = ModelDrafter(draft, self) if draft is not None else DFlashDrafter(config, self)
 
     # ------------------------------------------------------------------ prefill
-    def prefill_aux(self, seqs: list[Sequence]) -> torch.Tensor:
-        """The buffer the target's prefill exports the drafter's aux features into."""
+    def prefill_aux(self, seqs: list[Sequence]) -> torch.Tensor | None:
+        """The buffer the target's prefill exports aux features into: DFlash only."""
+        if not isinstance(self.drafter, DFlashDrafter):
+            return None
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs)
         return torch.empty(num_tokens, self.drafter.aux_width, dtype=self.drafter.aux_dtype, device=self.device)
 
     @torch.inference_mode()
-    def prefill_draft(self, seqs: list[Sequence], aux: torch.Tensor) -> None:
+    def prefill_draft(self, seqs: list[Sequence], aux: torch.Tensor | None = None) -> None:
         """Bring the draft's KV up to the chunk the target just prefilled."""
         self.drafter.prefill(seqs, aux)
 
@@ -374,14 +450,18 @@ class SpeculativeDecoder:
         for seq in seqs:
             assert seq.target_kv.num_cached_tokens == len(seq) - 1
         mark = self._mark("start", None)
+        if isinstance(self.drafter, ModelDrafter):
+            self.drafter.catch_up(seqs)
+            mark = self._mark("catch_up", mark)
         sampling = sampling_tensors(seqs, self.device)
         drafts, draft_probs = self.drafter.propose(seqs, sampling)
         mark = self._mark("propose", mark)
-        aux = self._aux_buffer(len(seqs))
+        aux = self._aux_buffer(len(seqs)) if isinstance(self.drafter, DFlashDrafter) else None
         target_logits = self.verify_logits(seqs, drafts, aux)
         mark = self._mark("verify", mark)
-        self.drafter.after_verify(seqs, aux)
-        mark = self._mark("ctx_store", mark)
+        if aux is not None:
+            self.drafter.after_verify(seqs, aux)
+            mark = self._mark("ctx_store", mark)
         if sampling.temperatures is None:
             n_accept, tail = accept_greedy(target_logits, drafts)
         else:
@@ -453,7 +533,7 @@ class SpeculativeDecoder:
     @torch.inference_mode()
     def capture_graphs(self) -> None:
         """One verification graph per batch size of the target's decode-graph table; query length fixed to k+1.
-        The drafter then captures its block forward for the same batch sizes."""
+        A DFlash drafter then captures its block forward for the same batch sizes."""
         query_len = self.num_drafts + 1
         self.graph_batch_sizes = list(self.target.graph_bs)
         max_batch_size = self.graph_batch_sizes[-1]
@@ -468,10 +548,10 @@ class SpeculativeDecoder:
             "cu_seqlens_k": self._device_tensor(all_padding.cu_seqlens_k, torch.int32),
             "block_tables": self._device_tensor(all_padding.block_tables, torch.int32),
             "outputs": torch.zeros(max_batch_size * query_len, hf_config.hidden_size, dtype=hf_config.dtype, device=self.device),
-            # the graphs also export the target's aux features
-            "aux": torch.zeros(max_batch_size * query_len, self.drafter.aux_width, dtype=self.drafter.aux_dtype,
-                               device=self.device),
         }
+        if isinstance(self.drafter, DFlashDrafter):    # the graphs also export the target's aux features
+            self.graph_vars["aux"] = torch.zeros(max_batch_size * query_len, self.drafter.aux_width,
+                                                 dtype=self.drafter.aux_dtype, device=self.device)
         with torch.device(self.device):
             for batch_size in reversed(self.graph_batch_sizes):
                 rows = batch_size * query_len
@@ -483,11 +563,12 @@ class SpeculativeDecoder:
                 self.graphs[batch_size] = graph
                 torch.cuda.synchronize()
                 reset_context()
-        self.drafter.capture_graphs()
+        if isinstance(self.drafter, DFlashDrafter):
+            self.drafter.capture_graphs()
 
     def _graph_forward(self, rows: int) -> torch.Tensor:
-        return self.target.model(self.graph_vars["input_ids"][:rows], self.graph_vars["positions"][:rows],
-                                 self.graph_vars["aux"][:rows])
+        aux = self.graph_vars["aux"][:rows] if "aux" in self.graph_vars else None
+        return self.target.model(self.graph_vars["input_ids"][:rows], self.graph_vars["positions"][:rows], aux)
 
     def _set_graph_context(self, batch_size: int) -> None:
         rows = batch_size * (self.num_drafts + 1)
@@ -499,8 +580,9 @@ class SpeculativeDecoder:
     def close(self) -> None:
         self.graphs.clear()
         self.graph_vars.clear()
-        self.drafter.graphs.clear()
-        self.drafter.sampling_graphs.clear()
+        if isinstance(self.drafter, DFlashDrafter):
+            self.drafter.graphs.clear()
+            self.drafter.sampling_graphs.clear()
 
     # ------------------------------------------------------------------ tensors
     def _host_tensor(self, values: list, dtype: torch.dtype) -> torch.Tensor:
