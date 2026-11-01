@@ -5,11 +5,10 @@ from nanovllm import LLM, SamplingParams
 
 llm = LLM(
     "/path/to/Qwen3-8B",
-    draft_model="/path/to/Qwen3-0.6B",
-    num_speculative_tokens=3,
-    enable_prefix_cache=False,           # required with a draft model
-    kv_cache_memory_bytes=10 << 30,      # explicit budgets: two models share the GPU
-    draft_kv_cache_memory_bytes=6 << 30,
+    draft_model="/path/to/dflash_qwen3_8b_block7",   # deepseek-ai/dflash_qwen3_8b_block7
+    draft_type="dflash",
+    enable_prefix_cache=False,           # required with a draft
+    kv_cache_memory_bytes=10 << 30,      # explicit target KV budget; the draft's context K/V mirrors its blocks
     max_num_seqs=8,
     seed=0,                              # optional: reproducible sampling
 )
@@ -21,26 +20,15 @@ finally:
     llm.exit()
 ```
 
-For ordinary decoding leave out both `draft_model` and `num_speculative_tokens` (a `k > 0` without a draft is rejected); everything else is unchanged. Greedy
+For ordinary decoding leave out `draft_model` (a `num_speculative_tokens > 0` without a draft is rejected); everything else is unchanged. Greedy
 decoding is `temperature=0`. `top_p` requires `top_k` (the nucleus is computed over the
 top-k candidates).
 
 ## A DFlash draft
 
-```python
-llm = LLM(
-    "/path/to/Qwen3-8B",
-    draft_model="/path/to/dflash_qwen3_8b_block7",   # deepseek-ai/dflash_qwen3_8b_block7
-    draft_type="dflash",
-    enable_prefix_cache=False,
-    kv_cache_memory_bytes=10 << 30,
-    max_num_seqs=8,
-)
-```
-
-`num_speculative_tokens` defaults to the draft's block size (7) and cannot differ from it,
-and there is no `draft_kv_cache_memory_bytes`: the draft keeps its context K/V in the
-target's KV blocks. A round runs the draft once on a block of the last committed token
+The example above. `num_speculative_tokens` defaults to the draft's block size (7) and cannot
+differ from it, and `kv_cache_memory_bytes` is the only KV budget: the draft keeps its context
+K/V in blocks that mirror the target's. A round runs the draft once on a block of the last committed token
 plus 6 mask tokens (non-causal attention over context K/V projected from five target
 layers), verifies the 7 drafts as below, writes the context K/V of all 8 verified
 positions, and accepts with the same rule. Round-entry invariant: the draft's context
@@ -72,13 +60,16 @@ setting samples eagerly, with the same drafts, about 0.4–0.5 ms more per round
 
 ## What a round does
 
-For every sequence in a decode batch: the draft recomputes at most one missing KV entry
-(one decode-graph step), proposes `k` tokens (one decode-graph step each), the target
-scores `[last token, d1..dk]` in one forward through the paged varlen-attention path (a
-CUDA graph per padded batch size), rejection sampling accepts a prefix and draws one more
-token, and a single `[B, k+2]` copy brings the result to the host. Round-entry invariants:
-target KV covers `len-1` positions, draft KV covers `len-2` or `len-1`. The design is in
-`docs/design/batched-speculative-decoding.md`.
+For every sequence in a decode batch: the draft runs one block forward over the last
+committed token and `k-1` mask tokens and proposes `k` tokens, the target scores
+`[last token, d1..dk]` in one forward through the paged varlen-attention path and exports
+the features of the layers the draft reads, the draft writes the context K/V of all `k+1`
+verified positions, rejection sampling accepts a prefix and draws one more token, and a
+single `[B, k+2]` copy brings the result to the host. The draft block and the verification
+each replay a CUDA graph per padded batch size. Round-entry invariant: the target's KV and
+the draft's context K/V cover `len-1` positions. The September design, with a 0.6B model
+draft, is in `docs/design/batched-speculative-decoding.md`; its code is at tag
+`results-batched-v1`.
 
 ## Reproducibility
 
@@ -103,8 +94,9 @@ from them.
 
 ## Gates
 
-`tools/v1/gate_smoke.py`, `tools/gate_verify_logits.py` (G1: verification logits vs decode
-logits), `tools/gate_sampler_distribution.py` (G2: sampler distribution),
-`tools/v1/gate_greedy_equivalence.py` (G3: greedy match rate with per-divergence logit
-margins) and `tools/v1/gate_divergence_probe.py` (decode vs verify logits on identical KV
-at G3 divergence points) run on a CUDA machine with both models.
+`tools/gate_verify_logits.py` (G1-wide: verification logits vs step-by-step decoding),
+`tools/gate_sampler_distribution.py` (G2-real: sampler distribution),
+`tools/gate_task_accuracy.py` (G5: GSM8K accuracy) and `tools/gate_dflash.py` (the block
+draft against DeepSpec, CUDA graphs against eager) run on a CUDA machine. The September
+gates in `tools/v1/` (smoke, G3 greedy equivalence and its divergence probe) need the 0.6B
+draft and run at tag `results-batched-v1`.
