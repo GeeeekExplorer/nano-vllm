@@ -2,10 +2,12 @@
 before it (the anchor for row 0), and the q handed to acceptance is each row's distribution after its bias. The
 sampling graphs capture the same rows; their body is checked here run eagerly, the capture itself on the GPU."""
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
 
+from nanovllm.engine import speculative
 from nanovllm.engine.batch_metadata import draft_block_metadata
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.speculative import DFlashDrafter, SpeculativeDecoder, sampling_graph_key
@@ -24,7 +26,8 @@ def make_drafter(k: int, bias: torch.Tensor = BIAS) -> DFlashDrafter:
     config = SimpleNamespace(num_speculative_tokens=k, kvcache_block_size=256, max_model_len=64,
                              hf_config=SimpleNamespace(vocab_size=bias.shape[1]))
     target = SimpleNamespace(device=CPU, generator=torch.Generator().manual_seed(0))
-    decoder = SpeculativeDecoder(target, object(), config)    # builds a ModelDrafter, unused here
+    with mock.patch.object(speculative, "DFlashDrafter", lambda config, decoder: None):    # it would load a checkpoint
+        decoder = SpeculativeDecoder(target, config)
     drafter = object.__new__(DFlashDrafter)
     drafter.decoder = decoder
     drafter.model = SimpleNamespace(markov_head=lambda prev: bias[prev], compute_logits=lambda hidden: hidden)

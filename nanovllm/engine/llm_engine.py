@@ -10,20 +10,8 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
-from nanovllm.engine.dual_model import DualModelRunner
 from nanovllm.engine.speculative import SpeculativeDecoder
 from nanovllm.engine.step_timer import StepTimer
-
-
-def _draft_config(config: Config, config_kwargs: dict) -> Config:
-    draft_kwargs = {**config_kwargs, "kv_cache_memory_bytes": config.draft_kv_cache_memory_bytes,
-                    "draft_model": None, "num_speculative_tokens": 0, "draft_kv_cache_memory_bytes": None}
-    draft_config = Config(config.draft_model, **draft_kwargs)
-    if draft_config.max_model_len != config.max_model_len:
-        raise ValueError("target and draft disagree on max_model_len; pass a max_model_len both support")
-    if draft_config.hf_config.vocab_size != config.hf_config.vocab_size:
-        raise ValueError("target and draft must share the vocabulary")
-    return draft_config
 
 
 class LLMEngine:
@@ -36,39 +24,27 @@ class LLMEngine:
         self.config = config
         self.ps = []
         self.events = []
-        self.dual_runner = None
         self.speculative = None
-        draft_config = None
-        if config.draft_model is not None and config.draft_type == "model":
-            draft_config = _draft_config(config, config_kwargs)
-            self.dual_runner = DualModelRunner(config, draft_config)
-            self.model_runner = self.dual_runner.target
-        else:
-            ctx = mp.get_context("spawn")
-            for i in range(1, config.tensor_parallel_size):
-                event = ctx.Event()
-                process = ctx.Process(target=ModelRunner, args=(config, i, event))
-                process.start()
-                self.ps.append(process)
-                self.events.append(event)
-            self.model_runner = ModelRunner(config, 0, self.events)
+        ctx = mp.get_context("spawn")
+        for i in range(1, config.tensor_parallel_size):
+            event = ctx.Event()
+            process = ctx.Process(target=ModelRunner, args=(config, i, event))
+            process.start()
+            self.ps.append(process)
+            self.events.append(event)
+        self.model_runner = ModelRunner(config, 0, self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         if config.draft_model is not None:
-            if draft_config is not None:
-                draft_eos = AutoTokenizer.from_pretrained(config.draft_model, use_fast=True).eos_token_id
-                draft_config.eos = config.eos
-            else:    # a DFlash draft directory has its config and weights, no tokenizer
-                draft_eos = AutoConfig.from_pretrained(config.draft_model).eos_token_id
-            if draft_eos != config.eos:
+            # a block draft's directory has its config and weights, no tokenizer
+            if AutoConfig.from_pretrained(config.draft_model).eos_token_id != config.eos:
                 raise ValueError("target and draft tokenizers disagree on the EOS token")
-            draft_runner = self.dual_runner.draft if self.dual_runner is not None else None
-            self.speculative = SpeculativeDecoder(self.model_runner, draft_runner, config)
+            self.speculative = SpeculativeDecoder(self.model_runner, config)
             if not config.enforce_eager:
                 self.speculative.capture_graphs()
             if config.record_step_timings:
                 self.speculative.enable_phase_timings()
-        self.scheduler = Scheduler(config, draft_config)
+        self.scheduler = Scheduler(config)
         self.step_timer = StepTimer(config.record_step_timings)
         self.num_steps = 0
         self._exited = False
@@ -80,10 +56,7 @@ class LLMEngine:
         self._exited = True
         if self.speculative is not None:
             self.speculative.close()
-        if self.dual_runner is not None:
-            self.dual_runner.exit()
-        else:
-            self.model_runner.call("exit")
+        self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
             p.join()

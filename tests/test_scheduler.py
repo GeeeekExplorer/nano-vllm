@@ -18,14 +18,11 @@ def small_blocks():
     Sequence.block_size = previous
 
 
-def make_scheduler(num_speculative_tokens, num_blocks=16, draft_blocks=16, max_num_seqs=4):
+def make_scheduler(num_speculative_tokens, num_blocks=16, max_num_seqs=4):
     config = SimpleNamespace(max_num_seqs=max_num_seqs, max_num_batched_tokens=64, eos=EOS,
                              kvcache_block_size=BLOCK_SIZE, num_kvcache_blocks=num_blocks,
                              enable_prefix_cache=False, num_speculative_tokens=num_speculative_tokens)
-    draft_config = None
-    if num_speculative_tokens:
-        draft_config = SimpleNamespace(num_kvcache_blocks=draft_blocks)
-    return Scheduler(config, draft_config)
+    return Scheduler(config)
 
 
 def prefilled(scheduler, prompt, first_token, **params):
@@ -38,21 +35,19 @@ def prefilled(scheduler, prompt, first_token, **params):
     return seq
 
 
-def test_prefill_allocates_and_advances_both_kv_states():
+def test_prefill_allocates_and_advances_the_kv_state():
     scheduler = make_scheduler(num_speculative_tokens=3)
     seq = prefilled(scheduler, [1, 2, 3, 4, 5], first_token=9, max_tokens=8)
-    assert seq.target_kv.block_table == [0, 1] and seq.draft_kv.block_table == [0, 1]
-    assert seq.target_kv.num_cached_tokens == 5 == seq.draft_kv.num_cached_tokens
+    assert seq.target_kv.block_table == [0, 1] and seq.target_kv.num_cached_tokens == 5
     assert len(seq) == 6 and seq.num_cached_tokens == len(seq) - 1
 
 
-def test_decode_scheduling_reserves_len_plus_k_for_target_and_len_plus_k_minus_1_for_draft():
+def test_decode_scheduling_reserves_len_plus_k():
     scheduler = make_scheduler(num_speculative_tokens=3)
-    seq = prefilled(scheduler, [1, 2, 3, 4, 5], first_token=9, max_tokens=8)   # len 6 -> target 9 tokens, draft 8
+    seq = prefilled(scheduler, [1, 2, 3, 4, 5], first_token=9, max_tokens=8)   # len 6 -> 9 tokens
     seqs, is_prefill = scheduler.schedule()
     assert not is_prefill and seqs == [seq]
     assert len(seq.target_kv.block_table) == 3
-    assert len(seq.draft_kv.block_table) == 2
 
 
 def test_k0_decode_reserves_exactly_like_upstream():
@@ -60,32 +55,28 @@ def test_k0_decode_reserves_exactly_like_upstream():
     seq = prefilled(scheduler, [1, 2, 3, 4], first_token=9, max_tokens=8)        # len 5 -> block for position 4
     scheduler.schedule()
     assert len(seq.block_table) == 2
-    assert scheduler.draft_block_manager is None
 
 
-def test_decode_preempts_the_last_running_sequence_when_the_draft_pool_is_short():
-    scheduler = make_scheduler(num_speculative_tokens=3, draft_blocks=4)
-    first = prefilled(scheduler, [1, 2, 3, 4, 5], first_token=9, max_tokens=8)    # 2 draft blocks each
+def test_decode_preempts_the_last_running_sequence_when_the_pool_is_short():
+    scheduler = make_scheduler(num_speculative_tokens=3, num_blocks=6)
+    first = prefilled(scheduler, [1, 2, 3, 4, 5], first_token=9, max_tokens=8)    # 2 blocks each
     second = prefilled(scheduler, [1, 2, 3, 4, 5], first_token=9, max_tokens=8)
-    seqs, is_prefill = scheduler.schedule()                  # len 6: draft needs 8 tokens = 2 blocks, fits
+    seqs, is_prefill = scheduler.schedule()                  # len 6: a round needs 9 tokens = 3 blocks, all 6 used
     assert not is_prefill and seqs == [first, second]
-    scheduler.postprocess_speculative(seqs, [[10, 11, 12], [10, 11, 12]])   # len 9: draft needs 11 = 3 blocks
-    seqs, is_prefill = scheduler.schedule()                  # no free draft block: the last running seq is preempted
+    scheduler.postprocess_speculative(seqs, [[10, 11, 12, 13], [10, 11, 12, 13]])   # len 10: 13 tokens = 4 blocks
+    seqs, is_prefill = scheduler.schedule()                  # no free block: the last running seq is preempted
     assert not is_prefill and seqs == [first]
-    assert second.status == SequenceStatus.WAITING
-    assert second.draft_kv.block_table == [] and second.target_kv.block_table == []
-    assert len(first.draft_kv.block_table) == 3
+    assert second.status == SequenceStatus.WAITING and second.target_kv.block_table == []
+    assert len(first.target_kv.block_table) == 4
 
 
-def test_postprocess_speculative_keeps_the_kv_invariants():
+def test_postprocess_speculative_keeps_the_kv_invariant():
     scheduler = make_scheduler(num_speculative_tokens=3)
     seq = prefilled(scheduler, [1, 2, 3, 4, 5], first_token=9, max_tokens=8)
     scheduler.schedule()
-    len_before = len(seq)
     scheduler.postprocess_speculative([seq], [[10, 11, 12, 13]])          # all three accepted + bonus
     assert seq.completion_token_ids == [9, 10, 11, 12, 13]
     assert seq.target_kv.num_cached_tokens == len(seq) - 1
-    assert seq.draft_kv.num_cached_tokens == len_before - 1 + 3 == len(seq) - 2
     assert seq in scheduler.running
 
 
@@ -95,10 +86,9 @@ def test_postprocess_speculative_after_partial_acceptance():
     scheduler.schedule()
     scheduler.postprocess_speculative([seq], [[10, 11]])                   # one accepted + correction
     assert seq.target_kv.num_cached_tokens == len(seq) - 1
-    assert seq.draft_kv.num_cached_tokens == len(seq) - 1
 
 
-def test_postprocess_speculative_stops_at_eos_and_frees_both_pools():
+def test_postprocess_speculative_stops_at_eos_and_frees_the_blocks():
     scheduler = make_scheduler(num_speculative_tokens=3)
     seq = prefilled(scheduler, [1, 2, 3, 4, 5], first_token=9, max_tokens=8)
     scheduler.schedule()
@@ -106,7 +96,6 @@ def test_postprocess_speculative_stops_at_eos_and_frees_both_pools():
     assert seq.completion_token_ids == [9, 10, EOS]
     assert seq.is_finished and seq not in scheduler.running
     assert len(scheduler.block_manager.free_block_ids) == 16
-    assert len(scheduler.draft_block_manager.free_block_ids) == 16
 
 
 def test_postprocess_speculative_stops_at_max_tokens():

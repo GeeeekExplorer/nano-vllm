@@ -158,16 +158,12 @@ def kwargs_of_every_line(protocol_file: str, tmp_path) -> dict[str, dict]:
 
 
 def test_engine_kwargs_follow_the_protocol_lines(tmp_path):
-    kwargs = kwargs_of_every_line("protocol-v2.json", tmp_path)
+    kwargs = kwargs_of_every_line("protocol-v2.1.json", tmp_path)
     assert len({value["kv_cache_memory_bytes"] for value in kwargs.values()}) == 1    # one target budget for every line
     assert "draft_model" not in kwargs["k0"]
-    assert kwargs["model_k3"]["num_speculative_tokens"] == 3 and kwargs["model_k3"]["draft_kv_cache_memory_bytes"] > 0
-    assert "draft_type" not in kwargs["model_k3"]
     assert kwargs["dflash_k7"]["draft_type"] == "dflash" and kwargs["dflash_k7"]["num_speculative_tokens"] == 7
-    assert "draft_kv_cache_memory_bytes" not in kwargs["dflash_k7"]
 
 
 def test_engine_kwargs_give_dspark_its_draft_type(tmp_path):
     kwargs = kwargs_of_every_line("protocol-v2.1.json", tmp_path)
     assert kwargs["dspark_k7"]["draft_type"] == "dspark" and kwargs["dspark_k7"]["num_speculative_tokens"] == 7
-    assert "draft_kv_cache_memory_bytes" not in kwargs["dspark_k7"]

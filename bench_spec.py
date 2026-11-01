@@ -2,7 +2,8 @@
 
   --mode closed-loop  protocol v2: keep C requests in the engine, adding one as each finishes, until the panel is
                       used up (bench-v2 §1.1). Sampling, KV budgets, warm-up and the line's draft come from the protocol.
-  --mode offline      v1 (default): one generate() over the 48-prompt panel, so the v1 results stay reproducible.
+
+The v1 offline mode, one generate() over the 48-prompt panel with the 0.6B draft, is at tag results-batched-v1.
 
 One invocation = one configuration = one JSON result with a manifest, per-step timings, per-request
 records and acceptance statistics. tools/summarize_bench.py turns results into metrics.
@@ -20,11 +21,7 @@ from typing import TypedDict
 
 import torch
 
-from nanovllm.config import BLOCK_DRAFTS
-
 ROOT = Path(__file__).resolve().parent
-GIB = 1 << 30
-WARMUP_PROMPTS = 4
 SCHEMA = "bench-v2"
 RESULT_KEYS = ("schema", "protocol_sha256", "manifest", "gpu_state_start", "gpu_state_end", "config",
                "wall_seconds", "steps", "phases", "requests", "speculative_stats")
@@ -77,8 +74,8 @@ def kv_block_bytes(model_dir: str, block_size: int = 256) -> int:
 def engine_kwargs(protocol: dict, line: dict, panel: list[PanelEntry], concurrency: int, seed: int,
                   models_root: str) -> tuple[str, str | None, dict]:
     """Target directory, draft directory and LLM keyword arguments of one protocol line. Every line gets the target
-    KV budget of the largest k; a model draft gets the same block count in its own pool, a block draft's KV mirrors
-    the target's blocks. The protocol names block drafts by their draft_type (dflash, dspark)."""
+    KV budget of the largest k; a block draft's KV mirrors the target's blocks. The protocol names block drafts by
+    their draft_type (dflash, dspark)."""
     max_tokens = protocol["sampling"]["max_tokens"]
     budget_k = max(spec["k"] for spec in protocol["lines"].values())
     target = f"{models_root}/{protocol['models']['target']}"
@@ -89,12 +86,7 @@ def engine_kwargs(protocol: dict, line: dict, panel: list[PanelEntry], concurren
     draft = None
     if line["drafter"] is not None:
         draft = f"{models_root}/{protocol['models']['drafts'][line['drafter']]}"
-        kwargs.update(draft_model=draft, num_speculative_tokens=line["k"])
-        if line["drafter"] in BLOCK_DRAFTS:
-            kwargs.update(draft_type=line["drafter"])
-        else:
-            kwargs.update(draft_kv_cache_memory_bytes=kv_budget_bytes(panel, concurrency, max_tokens, budget_k,
-                                                                      kv_block_bytes(draft)))
+        kwargs.update(draft_model=draft, num_speculative_tokens=line["k"], draft_type=line["drafter"])
     return target, draft, kwargs
 
 
@@ -206,7 +198,7 @@ def closed_loop(args: argparse.Namespace) -> None:
               "repeat": args.repeat, "num_requests": len(panel), "sampling": {**rec, "max_tokens": sampling["max_tokens"]},
               "target": target, "draft": draft,
               **{key: kwargs.get(key) for key in ("max_model_len", "max_num_batched_tokens", "kv_cache_memory_bytes",
-                                                  "draft_kv_cache_memory_bytes", "draft_type")}}
+                                                  "draft_type")}}
     result = build_result(
         protocol_sha256=hashlib.sha256(protocol_text.encode()).hexdigest(),
         manifest={**manifest(args.commit), "node": state_start["node"], "packages_sha256": packages_sha256,
@@ -221,73 +213,11 @@ def closed_loop(args: argparse.Namespace) -> None:
     llm.exit()
 
 
-def parse_offline_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--target", required=True)
-    parser.add_argument("--draft")
-    parser.add_argument("--k", type=int, default=0)
-    parser.add_argument("--max-num-seqs", type=int, required=True)
-    parser.add_argument("--temperature", type=float, required=True)
-    parser.add_argument("--top-k", type=int, default=0)
-    parser.add_argument("--top-p", type=float, default=1.0)
-    parser.add_argument("--max-tokens", type=int, default=512)
-    parser.add_argument("--max-model-len", type=int, default=4096)
-    parser.add_argument("--target-kv-gib", type=float, default=10)
-    parser.add_argument("--draft-kv-gib", type=float, default=6)
-    parser.add_argument("--seed", type=int, default=17011)
-    parser.add_argument("--panel", default="benchmarks/inputs/panel-48.json")
-    parser.add_argument("--commit", required=True, help="git commit of the synced tree (the sync step refuses a dirty tree)")
-    parser.add_argument("--output", required=True)
-    return parser.parse_args(argv)
-
-
-def offline(args: argparse.Namespace) -> None:
-    from nanovllm import LLM, SamplingParams
-
-    kwargs = dict(max_model_len=args.max_model_len, max_num_seqs=args.max_num_seqs, enable_prefix_cache=False,
-                  kv_cache_memory_bytes=int(args.target_kv_gib * GIB), seed=args.seed, record_step_timings=True)
-    if args.k:
-        kwargs.update(draft_model=args.draft, num_speculative_tokens=args.k,
-                      draft_kv_cache_memory_bytes=int(args.draft_kv_gib * GIB))
-    llm = LLM(args.target, **kwargs)
-    panel = json.loads(Path(args.panel).read_text())
-    prompts = [entry["prompt_token_ids"] for entry in panel]
-    params = SamplingParams(temperature=args.temperature, top_k=args.top_k, top_p=args.top_p, max_tokens=args.max_tokens)
-
-    llm.generate(prompts[:WARMUP_PROMPTS], params, use_tqdm=False)          # warm-up: excluded
-    if llm.speculative is not None:
-        llm.speculative.stats.clear()
-    wall_start = time.perf_counter()
-    outputs = llm.generate(prompts, params, use_tqdm=False)
-    wall_seconds = time.perf_counter() - wall_start
-    result = {
-        "manifest": manifest(args.commit),
-        "config": {"target": args.target, "draft": args.draft, "num_speculative_tokens": args.k,
-                   "max_num_seqs": args.max_num_seqs, "temperature": args.temperature, "top_k": args.top_k,
-                   "top_p": args.top_p, "max_tokens": args.max_tokens, "max_model_len": args.max_model_len,
-                   "seed": args.seed, "panel": args.panel, "num_prompts": len(prompts)},
-        "wall_seconds": wall_seconds,
-        "step_timings": llm.step_timings(),
-        "phase_timings": llm.phase_timings(),
-        "outputs": [{"id": entry["id"], "token_ids": output["token_ids"], "first_token_step": output["first_token_step"],
-                     "finish_step": output["finish_step"]} for entry, output in zip(panel, outputs)],
-        "speculative_stats": dict(llm.speculative.stats) if llm.speculative is not None else None,
-    }
-    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.output).write_text(json.dumps(result))
-    completion_tokens = sum(len(output["token_ids"]) for output in outputs)
-    print(f"{args.output}: {completion_tokens} tokens in {wall_seconds:.1f}s wall")
-    llm.exit()
-
-
 def main(argv: list[str] | None = None) -> None:
     mode_parser = argparse.ArgumentParser(add_help=False)
-    mode_parser.add_argument("--mode", choices=["offline", "closed-loop"], default="offline")
-    known, rest = mode_parser.parse_known_args(argv)
-    if known.mode == "closed-loop":
-        closed_loop(parse_closed_loop_args(rest))
-    else:
-        offline(parse_offline_args(rest))
+    mode_parser.add_argument("--mode", choices=["closed-loop"], default="closed-loop")
+    _, rest = mode_parser.parse_known_args(argv)
+    closed_loop(parse_closed_loop_args(rest))
 
 
 if __name__ == "__main__":
