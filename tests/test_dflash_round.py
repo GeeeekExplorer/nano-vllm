@@ -7,10 +7,12 @@ committed token there, never a block's K/V or a rejected draft's features.
 """
 import random
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
 
+from nanovllm.engine import speculative
 from nanovllm.engine.batch_metadata import prefill_metadata, slot_of
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.speculative import DFlashDrafter, SpeculativeDecoder
@@ -115,7 +117,8 @@ def make_decoder(is_right):
     config = SimpleNamespace(num_speculative_tokens=K, kvcache_block_size=BLOCK_SIZE, max_model_len=512,
                              hf_config=SimpleNamespace(vocab_size=VOCAB))
     target = FakeTarget()
-    decoder = Decoder(target, object(), config)    # builds a ModelDrafter, replaced below
+    with mock.patch.object(speculative, "DFlashDrafter", lambda config, decoder: None):    # it would load a checkpoint
+        decoder = Decoder(target, config)
     drafter = object.__new__(DFlashDrafter)
     drafter.decoder, drafter.model = decoder, FakeDFlash(decoder, is_right)
     drafter.aux_width, drafter.aux_dtype, drafter.graphs = 2, torch.float32, {}
