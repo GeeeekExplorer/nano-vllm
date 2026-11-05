@@ -7,7 +7,7 @@
 </p>
 
 # Nano-vLLM
-# 2026/11/04
+
 A lightweight vLLM implementation built from scratch.
 
 ## Key Features
@@ -21,6 +21,7 @@ A lightweight vLLM implementation built from scratch.
 ```bash
 pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
 ```
+
 ## Model Download
 
 To download the model weights manually, use the following command:
