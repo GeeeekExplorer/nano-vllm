@@ -45,7 +45,23 @@ outputs[0]["text"]
 
 ## Benchmark
 
-See `bench.py` for benchmark.
+Run `python3 bench.py --help` for offline benchmark options. For example:
+
+```bash
+python3 bench.py --model ~/huggingface/Qwen3-0.6B --num-seqs 256 --seed 0 --runs 3 --output results.json
+python3 -m unittest discover -s tests -v
+```
+
+The benchmark excludes a short warmup and times each entire `LLM.generate` batch,
+including prefill, decode, and host overhead; it does not measure TTFT or TPOT.
+Throughput uses the actual returned output tokens. JSON reports individual runs,
+median and nearest-rank p95 batch latency (sorted sample at `ceil(0.95 * runs)`,
+using one-based indexing), and total output tokens divided by total measured time.
+A local seeded generator creates a fresh workload for each run, so lengths vary
+and results are reproducible for a given configuration and seed. Prefix caching
+remains enabled, so incidental cache hits and other state across runs can affect
+results; runs are not independent cold starts. The historical scores below were
+measured separately and are not a claim about results from this script.
 
 **Test Configuration:**
 - Hardware: RTX 4070 Laptop (8GB)
