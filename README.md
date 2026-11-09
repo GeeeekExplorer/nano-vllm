@@ -43,6 +43,23 @@ outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
 
+## One-shot Modal job
+
+[`modal_app.py`](modal_app.py) runs a single prompt remotely and prints its
+completion. It stores model weights in a Modal Volume, so the initial download
+is reused by later jobs.
+
+```bash
+pip install modal
+modal setup
+modal run modal_app.py --prompt "Explain KV caching in one sentence."
+```
+
+The wrapper uses one A10 GPU and Qwen3-0.6B by default. A10 is a low-cost
+Modal GPU compatible with this project's FlashAttention 2 dependency; T4 is
+cheaper but unsupported by FlashAttention 2. To change the model or generation
+limits, pass `--model-id`, `--max-tokens`, and `--temperature` to `modal run`.
+
 ## Benchmark
 
 See `bench.py` for benchmark.
