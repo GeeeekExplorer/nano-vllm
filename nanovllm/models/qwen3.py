@@ -9,7 +9,7 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
-
+from nanovllm.layers.qk_norm_rope_mps import qk_norm_rope_mps, supports_qk_norm_rope_mps
 
 class Qwen3Attention(nn.Module):
 
@@ -26,7 +26,7 @@ class Qwen3Attention(nn.Module):
         rope_scaling: dict | None = None,
     ) -> None:
         super().__init__()
-        tp_size = dist.get_world_size()
+        tp_size = dist.get_world_size() if dist.is_initialized() else 1
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -75,6 +75,15 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
+        if (not self.qkv_bias and supports_qk_norm_rope_mps(qkv, self.head_dim,
+                                                            self.rotary_emb.cos_sin_cache)):
+            q, k = qk_norm_rope_mps(
+                qkv, positions, self.q_norm.weight, self.k_norm.weight, self.rotary_emb.cos_sin_cache,
+                self.num_heads, self.num_kv_heads, self.head_dim, self.q_norm.eps,
+            )
+            v = qkv[:, self.q_size + self.kv_size:].view(-1, self.num_kv_heads, self.head_dim)
+            o = self.attn(q, k, v)
+            return self.o_proj(o.flatten(1, -1))
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)

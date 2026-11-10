@@ -1,66 +1,45 @@
-<p align="center">
-<img width="300" src="assets/logo.png">
-</p>
+# nano-vLLM
 
-<p align="center">
-<a href="https://trendshift.io/repositories/15323" target="_blank"><img src="https://trendshift.io/api/badge/repositories/15323" alt="GeeeekExplorer%2Fnano-vllm | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-</p>
+Lightweight Qwen3 inference on CUDA and Apple Silicon.
 
-# Nano-vLLM
+CUDA uses FlashAttention, Triton KV writes, CUDA graphs, and tensor parallelism. The MPS path uses Metal kernels for KV writes, Q/K normalization with rotary embedding, and paged decode attention. MPS runs on one GPU; prefill and unsupported shapes use PyTorch attention.
 
-A lightweight vLLM implementation built from scratch.
+## Setup
 
-## Key Features
-
-* 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
-* 📖 **Readable codebase** - Clean implementation in ~ 1,200 lines of Python code
-* ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Torch compilation, CUDA graph, etc.
-
-## Installation
+Use Python 3.10–3.12. On macOS, install a PyTorch build with `torch.mps.compile_shader`.
 
 ```bash
-pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
+python -m pip install -e .
 ```
 
-## Model Download
+Put [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) in `Qwen3-0.6B/`, or pass another local checkpoint with `--model`.
 
-To download the model weights manually, use the following command:
+## Run
+
 ```bash
-huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
-  --local-dir ~/huggingface/Qwen3-0.6B/ \
-  --local-dir-use-symlinks False
+python example.py
+python bench.py --model Qwen3-0.6B --device mps --gpu-memory-utilization 0.64
 ```
 
-## Quick Start
+The MPS memory setting above was measured on a 48 GB M4 Pro. Adjust it for your machine. `example.py` also accepts `--device cuda`.
 
-See `example.py` for usage. The API mirrors vLLM's interface with minor differences in the `LLM.generate` method:
-```python
-from nanovllm import LLM, SamplingParams
-llm = LLM("/YOUR/MODEL/PATH", enforce_eager=True, tensor_parallel_size=1)
-sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
-prompts = ["Hello, Nano-vLLM."]
-outputs = llm.generate(prompts, sampling_params)
-outputs[0]["text"]
+The benchmark uses the upstream seeded workload: 256 requests, input and output lengths of 100–1024 tokens, and 133,966 generated tokens.
+
+| System | Time | Output throughput |
+| --- | ---: | ---: |
+| M4 Pro, 48 GB, MPS | 127.77 s | 1,048.51 tokens/s |
+| RTX 4070 Laptop, 8 GB, CUDA ([upstream result](https://github.com/GeeeekExplorer/nano-vllm#benchmark)) | 93.41 s | 1,434.13 tokens/s |
+
+These figures compare the same workload on different hardware. On the M4 Pro, the optimized MPS path measured 1,007.54 tokens/s against 911.15 tokens/s for the earlier path with the same `0.67` memory setting.
+
+For a shorter local run, use `python -m benchmarks.bench_mps Qwen3-0.6B`. For one attention layer, use `python -m benchmarks.bench_attention_mps`.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -p 'test_*.py'
 ```
 
-## Benchmark
+MPS tests cover KV writes, attention, prefix reuse, and generation. CUDA regression tests require a CUDA machine. The random checkpoint generator is `python -m tools.make_tiny_qwen3 /tmp/nano-vllm-tiny-qwen3`.
 
-See `bench.py` for benchmark.
-
-**Test Configuration:**
-- Hardware: RTX 4070 Laptop (8GB)
-- Model: Qwen3-0.6B
-- Total Requests: 256 sequences
-- Input Length: Randomly sampled between 100–1024 tokens
-- Output Length: Randomly sampled between 100–1024 tokens
-
-**Performance Results:**
-| Inference Engine | Output Tokens | Time (s) | Throughput (tokens/s) |
-|----------------|-------------|----------|-----------------------|
-| vLLM           | 133,966     | 98.37    | 1361.84               |
-| Nano-vLLM      | 133,966     | 93.41    | 1434.13               |
-
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=GeeeekExplorer/nano-vllm&type=Date)](https://www.star-history.com/#GeeeekExplorer/nano-vllm&Date)
+MIT licensed. See [LICENSE](LICENSE).
