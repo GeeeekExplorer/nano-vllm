@@ -20,8 +20,8 @@ class LinearBase(nn.Module):
     ):
         super().__init__()
         self.tp_dim = tp_dim
-        self.tp_rank = dist.get_rank()
-        self.tp_size = dist.get_world_size()
+        self.tp_rank = dist.get_rank() if dist.is_initialized() else 0
+        self.tp_size = dist.get_world_size() if dist.is_initialized() else 1
         self.weight = nn.Parameter(torch.empty(output_size, input_size))
         self.weight.weight_loader = self.weight_loader
         if bias:
@@ -59,7 +59,7 @@ class ColumnParallelLinear(LinearBase):
         output_size: int,
         bias: bool = False,
     ):
-        tp_size = dist.get_world_size()
+        tp_size = dist.get_world_size() if dist.is_initialized() else 1
         super().__init__(input_size, divide(output_size, tp_size), bias, 0)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -103,7 +103,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         total_num_kv_heads: int | None = None,
         bias: bool = False,
     ):
-        tp_size = dist.get_world_size()
+        tp_size = dist.get_world_size() if dist.is_initialized() else 1
         total_num_kv_heads = total_num_kv_heads or total_num_heads
         self.head_size = head_size
         self.num_heads = divide(total_num_heads, tp_size)
@@ -136,7 +136,7 @@ class RowParallelLinear(LinearBase):
         output_size: int,
         bias: bool = False,
     ):
-        tp_size = dist.get_world_size()
+        tp_size = dist.get_world_size() if dist.is_initialized() else 1
         super().__init__(divide(input_size, tp_size), output_size, bias, 1)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):

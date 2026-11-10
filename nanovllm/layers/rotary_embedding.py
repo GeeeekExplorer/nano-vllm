@@ -22,12 +22,13 @@ class RotaryEmbedding(nn.Module):
         rotary_dim: int,
         max_position_embeddings: int,
         base: float,
+        device: torch.device,
     ) -> None:
         super().__init__()
         self.head_size = head_size
         assert rotary_dim == head_size
-        inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
-        t = torch.arange(max_position_embeddings, dtype=torch.float)
+        inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float, device=device) / rotary_dim))
+        t = torch.arange(max_position_embeddings, dtype=torch.float, device=device)
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()
         sin = freqs.sin()
@@ -48,12 +49,17 @@ class RotaryEmbedding(nn.Module):
         return query, key
 
 
-@lru_cache(1)
-def get_rope(
+@lru_cache(4)
+def _get_rope(
     head_size: int,
     rotary_dim: int,
     max_position: int,
     base: float,
+    device: torch.device,
 ):
-    rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
+    rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base, device)
     return rotary_emb
+
+
+def get_rope(head_size: int, rotary_dim: int, max_position: int, base: float):
+    return _get_rope(head_size, rotary_dim, max_position, base, torch.get_default_device())
