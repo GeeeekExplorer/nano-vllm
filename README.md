@@ -22,6 +22,22 @@ A lightweight vLLM implementation built from scratch.
 pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
 ```
 
+### Native Windows (single NVIDIA GPU)
+
+The Windows path uses PyTorch attention instead of Triton and FlashAttention, and supports
+`tensor_parallel_size=1`. Its performance has not been measured against the Linux path on
+the same hardware. With Python 3.12,
+an NVIDIA driver compatible with CUDA 13.0, and `uv` installed, run in PowerShell:
+
+```powershell
+uv sync --python 3.12
+$env:PYTHONIOENCODING = "utf-8"
+uv run .\example.py
+```
+
+The project pins the Windows CUDA build of PyTorch from the official PyTorch index.
+`example.py` expects Qwen3-0.6B in `~/huggingface/Qwen3-0.6B/`.
+
 ## Model Download
 
 To download the model weights manually, use the following command:

@@ -1,4 +1,6 @@
 import pickle
+import os
+import sys
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -23,7 +25,12 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        if sys.platform == "win32" and self.world_size != 1:
+            raise ValueError("Native Windows inference currently supports tensor_parallel_size=1 only")
+        if sys.platform == "win32":
+            os.environ.setdefault("USE_LIBUV", "0")
+        backend = "gloo" if sys.platform == "win32" else "nccl"
+        dist.init_process_group(backend, "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
