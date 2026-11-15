@@ -12,10 +12,11 @@ readme = "README.md"
 description = "a lightweight vLLM implementation built from scratch"
 requires-python = ">=3.10,<3.13"
 dependencies = [
-    "torch>=2.4.0",
-    "triton>=3.0.0",
+    "torch>=2.4.0; sys_platform != 'win32'",
+    "torch==2.14.1+cu130; sys_platform == 'win32'",
+    "triton>=3.0.0; sys_platform != 'win32'",
     "transformers>=4.51.0",
-    "flash-attn",
+    "flash-attn; sys_platform != 'win32'",
     "xxhash",
 ]
 
@@ -25,3 +26,11 @@ Homepage="https://github.com/GeeeekExplorer/nano-vllm"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["nanovllm*"]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

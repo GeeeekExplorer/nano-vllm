@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+from nanovllm.utils.compile import compile_if_supported
 
 
 class RMSNorm(nn.Module):
@@ -13,7 +14,7 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
-    @torch.compile
+    @compile_if_supported
     def rms_forward(
         self,
         x: torch.Tensor,
@@ -25,7 +26,7 @@ class RMSNorm(nn.Module):
         x = x.to(orig_dtype).mul_(self.weight)
         return x
 
-    @torch.compile
+    @compile_if_supported
     def add_rms_forward(
         self,
         x: torch.Tensor,
