@@ -19,7 +19,8 @@ class Config:
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
-        assert self.kvcache_block_size % 256 == 0
+        if self.kvcache_block_size <= 0 or self.kvcache_block_size % 256 != 0:
+            raise ValueError("kvcache_block_size must be a positive multiple of 256")
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
