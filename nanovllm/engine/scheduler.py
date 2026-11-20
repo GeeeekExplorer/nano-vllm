@@ -55,7 +55,8 @@ class Scheduler:
             return scheduled_seqs, True
 
         # decode
-        while self.running and len(scheduled_seqs) < self.max_num_seqs:
+        max_decode_seqs = min(self.max_num_seqs, self.max_num_batched_tokens)
+        while self.running and len(scheduled_seqs) < max_decode_seqs:
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq):
                 if self.running:
