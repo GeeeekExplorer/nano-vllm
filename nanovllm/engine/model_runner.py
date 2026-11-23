@@ -29,6 +29,9 @@ class ModelRunner:
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config)
+        if config.fuse_decode_qk_rope:
+            for layer in self.model.model.layers:
+                layer.self_attn.fuse_decode_qk_rope = True
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()

@@ -8,6 +8,8 @@ from nanovllm.layers.attention import Attention
 from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
+from nanovllm.layers.qk_norm_rope import fused_qk_norm_rope
+from nanovllm.utils.context import get_context
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
@@ -38,6 +40,7 @@ class Qwen3Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
         self.qkv_bias = qkv_bias
+        self.fuse_decode_qk_rope = False
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -79,10 +82,15 @@ class Qwen3Attention(nn.Module):
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
-        if not self.qkv_bias:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
-        q, k = self.rotary_emb(positions, q, k)
+        if (self.fuse_decode_qk_rope and not self.qkv_bias and self.head_dim == 128
+                and q.dtype == torch.bfloat16 and not get_context().is_prefill):
+            q, k = fused_qk_norm_rope(q, k, self.q_norm.weight, self.k_norm.weight,
+                                      positions, self.rotary_emb.cos_sin_cache, self.q_norm.eps)
+        else:
+            if not self.qkv_bias:
+                q = self.q_norm(q)
+                k = self.k_norm(k)
+            q, k = self.rotary_emb(positions, q, k)
         o = self.attn(q, k, v)
         output = self.o_proj(o.flatten(1, -1))
         return output
