@@ -223,7 +223,8 @@ class ModelRunner:
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config
-        max_bs = min(self.config.max_num_seqs, 512)
+        max_bs = min(config.max_num_seqs, config.num_kvcache_blocks, 512)    # each running seq holds at least one block
+        max_bs = (max_bs + 15) // 16 * 16
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
