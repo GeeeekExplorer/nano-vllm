@@ -43,6 +43,10 @@ outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
 
+To run two engines on the same host, start them in separate processes with disjoint
+`CUDA_VISIBLE_DEVICES`. Give each a different `master_port`, e.g. `LLM(path, master_port=2334)`
+for the second process. The default is 2333.
+
 ## Benchmark
 
 See `bench.py` for benchmark.
