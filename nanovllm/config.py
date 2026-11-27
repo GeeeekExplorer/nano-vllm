@@ -1,5 +1,6 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from uuid import uuid4
 from transformers import AutoConfig
 
 
@@ -16,6 +17,8 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    master_port: int = 2333
+    shm_name: str = field(default_factory=lambda: f"nanovllm_{uuid4().hex[:16]}")
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
